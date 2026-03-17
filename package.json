@@ -1,0 +1,19 @@
+{
+  "name": "thinkdrop-personality-service",
+  "version": "1.0.0",
+  "description": "ThinkDrop Personality & Emotion MCP Service — persistent emotional state, live prompt overlay, heartbeat autonomy loop",
+  "main": "src/server.cjs",
+  "scripts": {
+    "start": "node src/server.cjs",
+    "dev": "node --watch src/server.cjs"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "node-cron": "^3.0.3",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
