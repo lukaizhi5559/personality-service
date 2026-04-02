@@ -25,13 +25,15 @@ const VOICE_SERVICE_PORT   = parseInt(process.env.VOICE_SERVICE_PORT   || '3006'
 const LLM_WS_URL           = process.env.STATEGRAPH_WS_URL || 'ws://localhost:4000/ws/stream';
 const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 
-const TIER1_INTERVAL_MS = 30 * 1000;          // 30 seconds
-const TIER2_INTERVAL_MS = 5  * 60 * 1000;     // 5 minutes
-const TIER3_INTERVAL_MS = 6  * 60 * 60 * 1000; // 6 hours
+const TIER1_INTERVAL_MS   = 30 * 1000;          // 30 seconds
+const TIER1_5_INTERVAL_MS = 60 * 1000;          // 60 seconds
+const TIER2_INTERVAL_MS   = 5  * 60 * 1000;     // 5 minutes
+const TIER3_INTERVAL_MS   = 6  * 60 * 60 * 1000; // 6 hours
 
-let _tier1Timer = null;
-let _tier2Timer = null;
-let _tier3Timer = null;
+let _tier1Timer   = null;
+let _tier1_5Timer = null;
+let _tier2Timer   = null;
+let _tier3Timer   = null;
 let _running    = false;
 
 // ── HTTP helpers ───────────────────────────────────────────────────────────────
@@ -177,6 +179,39 @@ async function biblicalGate(actionDescription) {
   }
 }
 
+// ── Tier 1.5: Task watchdog (every 60s) ──────────────────────────────────────
+
+async function runTier1_5() {
+  try {
+    const res   = await memPost('pending_tasks.list', { status: 'running' });
+    const tasks = (res && res.data && res.data.tasks) ? res.data.tasks : [];
+
+    if (tasks.length === 0) return;
+
+    logger.debug(`[Heartbeat:T1.5] ${tasks.length} running task(s) detected`);
+
+    const now = Date.now();
+    for (const task of tasks) {
+      const startedMs  = new Date(task.started_at).getTime();
+      const elapsedMin = Math.round((now - startedMs) / 60000);
+
+      // Warn at 15 minutes — halfway through 30-minute timeout
+      if (elapsedMin >= 15 && elapsedMin < 16) {
+        logger.warn(`[Heartbeat:T1.5] Task ${task.id} has been running ${elapsedMin}min`);
+        await voiceSpeak(`Still working on "${(task.sub_prompt || '').slice(0, 60)}..." — ${elapsedMin} minutes have passed.`);
+      }
+
+      // Final warning at 29 minutes — before watchdog kills it
+      if (elapsedMin >= 29 && elapsedMin < 30) {
+        logger.warn(`[Heartbeat:T1.5] Task ${task.id} approaching 30min timeout`);
+        await voiceSpeak(`The task "${(task.sub_prompt || '').slice(0, 40)}" is about to time out. I'll ask what you'd like to do.`);
+      }
+    }
+  } catch (e) {
+    logger.warn('[Heartbeat:T1.5] Error', { error: e.message });
+  }
+}
+
 // ── Tier 1: Natural decay (every 30s) ──────────────────────────────────────────
 
 async function runTier1() {
@@ -310,10 +345,14 @@ function start() {
   if (_running) return;
   _running = true;
 
-  logger.info('[Heartbeat] Starting — T1:30s T2:5min T3:6h');
+  logger.info('[Heartbeat] Starting — T1:30s T1.5:60s T2:5min T3:6h');
 
   // Tier 1 — fast decay tick
   _tier1Timer = setInterval(() => { runTier1().catch(() => {}); }, TIER1_INTERVAL_MS);
+
+  // Tier 1.5 — task watchdog (starts immediately)
+  _tier1_5Timer = setInterval(() => { runTier1_5().catch(() => {}); }, TIER1_5_INTERVAL_MS);
+  logger.info(`[Heartbeat] Tier 1.5 (task watchdog) started — ${TIER1_5_INTERVAL_MS / 1000}s interval`);
 
   // Tier 2 — awareness loop (starts after 2 min to give services time to boot)
   setTimeout(() => {
@@ -330,10 +369,11 @@ function start() {
 
 function stop() {
   _running = false;
-  if (_tier1Timer) { clearInterval(_tier1Timer); _tier1Timer = null; }
-  if (_tier2Timer) { clearInterval(_tier2Timer); _tier2Timer = null; }
-  if (_tier3Timer) { clearInterval(_tier3Timer); _tier3Timer = null; }
+  if (_tier1Timer)   { clearInterval(_tier1Timer);   _tier1Timer   = null; }
+  if (_tier1_5Timer) { clearInterval(_tier1_5Timer); _tier1_5Timer = null; }
+  if (_tier2Timer)   { clearInterval(_tier2Timer);   _tier2Timer   = null; }
+  if (_tier3Timer)   { clearInterval(_tier3Timer);   _tier3Timer   = null; }
   logger.info('[Heartbeat] Stopped');
 }
 
-module.exports = { start, stop, runTier1, runTier2, runTier3 };
+module.exports = { start, stop, runTier1, runTier1_5, runTier2, runTier3 };
