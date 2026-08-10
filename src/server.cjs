@@ -173,6 +173,22 @@ async function handleRequest(req, res) {
     return jsonResponse(res, 200, { status: 'ok', message: 'Tier-2 awareness check triggered' });
   }
 
+  // ── /monitor.event — receive monitor events from memory-service ──────────────
+  // The memory-service monitor POSTs here when app_change or screen_change fires.
+  // This triggers an event-driven Tier 2 awareness check (debounced).
+  if (action === 'monitor.event') {
+    const eventType = payload?.eventType;
+    const info = payload?.info || {};
+    logger.info(`[PersonalityService] Monitor event received: ${eventType}`, info);
+    // Trigger event-driven Tier 2 via the heartbeat module's debounce logic
+    if (typeof heartbeat._scheduleEventTier2 === 'function') {
+      heartbeat._scheduleEventTier2();
+    } else {
+      heartbeat.runTier2().catch(() => {});
+    }
+    return jsonResponse(res, 200, { status: 'ok', message: `Monitor event ${eventType} received` });
+  }
+
   // ── /heartbeat.tier3 — manual trigger for deep reflection (debug/testing) ────
   if (action === 'heartbeat.tier3') {
     heartbeat.runTier3().catch(() => {});

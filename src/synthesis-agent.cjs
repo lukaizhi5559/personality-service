@@ -87,8 +87,8 @@ async function askLLM(systemPrompt, userPrompt) {
           type: 'llm_request',
           payload: {
             prompt: userPrompt,
-            provider: 'openai',
-            options: { temperature: 0.4, stream: true, taskType: 'ask' },
+            provider: 'auto',
+            options: { temperature: 0.4, stream: true, taskType: 'synthesis' },
             context: { systemInstructions: systemPrompt },
           },
           timestamp: Date.now(),

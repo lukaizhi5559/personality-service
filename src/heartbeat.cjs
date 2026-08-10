@@ -36,6 +36,13 @@ let _tier2Timer   = null;
 let _tier3Timer   = null;
 let _running    = false;
 
+// Event-driven heartbeat: debounce monitor events to avoid spamming Tier 2
+let _eventDebounceTimer = null;
+let _lastEventTier2Time = 0;
+const EVENT_DEBOUNCE_MS = 2 * 60 * 1000;   // 2 min debounce for event-driven Tier 2
+const EVENT_MIN_GAP_MS  = 3 * 60 * 1000;   // 3 min minimum between event-triggered Tier 2 runs
+let _monitorService = null;
+
 // ── HTTP helpers ───────────────────────────────────────────────────────────────
 
 function memPost(action, payload) {
@@ -127,8 +134,8 @@ async function askLLM(systemPrompt, userPrompt, timeoutMs) {
           type: 'llm_request',
           payload: {
             prompt: userPrompt,
-            provider: 'openai',
-            options: { temperature: 0.3, stream: true, taskType: 'ask' },
+            provider: 'auto',
+            options: { temperature: 0.3, stream: true, taskType: 'heartbeat' },
             context: { systemInstructions: systemPrompt },
           },
           timestamp: Date.now(),
@@ -341,11 +348,57 @@ async function runTier3() {
 
 // ── Public API ─────────────────────────────────────────────────────────────────
 
+/**
+ * Subscribe to monitor service events for event-driven heartbeat.
+ * The monitor emits 'app_change' on app switch and 'screen_change' on major visual diff.
+ * We debounce these to trigger Tier 2 awareness checks at natural transition points
+ * instead of a fixed 5-min timer.
+ */
+function subscribeToMonitor(monitorService) {
+  _monitorService = monitorService;
+
+  const onAppChange = (info) => {
+    logger.info(`[Heartbeat] Event-driven: app_change → ${info.app}`, { previousApp: info.previousApp });
+    _scheduleEventTier2();
+  };
+
+  const onScreenChange = (info) => {
+    logger.info(`[Heartbeat] Event-driven: screen_change (diff ${(info.diffRatio * 100).toFixed(0)}%) in ${info.app}`);
+    _scheduleEventTier2();
+  };
+
+  monitorService.on('app_change', onAppChange);
+  monitorService.on('screen_change', onScreenChange);
+
+  // Store refs for cleanup
+  _monitorListeners = { onAppChange, onScreenChange };
+
+  logger.info('[Heartbeat] Subscribed to monitor events (app_change, screen_change)');
+}
+
+function _scheduleEventTier2() {
+  // Clear any pending debounce
+  if (_eventDebounceTimer) clearTimeout(_eventDebounceTimer);
+
+  _eventDebounceTimer = setTimeout(() => {
+    const now = Date.now();
+    if (now - _lastEventTier2Time < EVENT_MIN_GAP_MS) {
+      logger.debug('[Heartbeat] Event-driven Tier 2 skipped — too soon since last event run');
+      return;
+    }
+    _lastEventTier2Time = now;
+    logger.info('[Heartbeat] Event-driven Tier 2 awareness check triggered');
+    runTier2().catch(() => {});
+  }, EVENT_DEBOUNCE_MS);
+}
+
+let _monitorListeners = null;
+
 function start() {
   if (_running) return;
   _running = true;
 
-  logger.info('[Heartbeat] Starting — T1:30s T1.5:60s T2:5min T3:6h');
+  logger.info('[Heartbeat] Starting — T1:30s T1.5:60s T2:5min T3:6h + event-driven');
 
   // Tier 1 — fast decay tick
   _tier1Timer = setInterval(() => { runTier1().catch(() => {}); }, TIER1_INTERVAL_MS);
@@ -355,6 +408,8 @@ function start() {
   logger.info(`[Heartbeat] Tier 1.5 (task watchdog) started — ${TIER1_5_INTERVAL_MS / 1000}s interval`);
 
   // Tier 2 — awareness loop (starts after 2 min to give services time to boot)
+  // This is the FALLBACK timer — event-driven triggers (app_change, screen_change)
+  // fire Tier 2 at natural transition points. The 5-min timer covers idle periods.
   setTimeout(() => {
     runTier2().catch(() => {});
     _tier2Timer = setInterval(() => { runTier2().catch(() => {}); }, TIER2_INTERVAL_MS);
@@ -373,7 +428,14 @@ function stop() {
   if (_tier1_5Timer) { clearInterval(_tier1_5Timer); _tier1_5Timer = null; }
   if (_tier2Timer)   { clearInterval(_tier2Timer);   _tier2Timer   = null; }
   if (_tier3Timer)   { clearInterval(_tier3Timer);   _tier3Timer   = null; }
+  if (_eventDebounceTimer) { clearTimeout(_eventDebounceTimer); _eventDebounceTimer = null; }
+  // Unsubscribe from monitor events
+  if (_monitorService && _monitorListeners) {
+    _monitorService.off('app_change', _monitorListeners.onAppChange);
+    _monitorService.off('screen_change', _monitorListeners.onScreenChange);
+    _monitorListeners = null;
+  }
   logger.info('[Heartbeat] Stopped');
 }
 
-module.exports = { start, stop, runTier1, runTier1_5, runTier2, runTier3 };
+module.exports = { start, stop, runTier1, runTier1_5, runTier2, runTier3, subscribeToMonitor, _scheduleEventTier2 };
