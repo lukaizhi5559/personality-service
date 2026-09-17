@@ -127,13 +127,24 @@ async function askLLM(systemPrompt, userPrompt) {
 
 async function fetchRecentMemories(limit) {
   try {
+    // Semantic memory (user facts, clarifications, prior syntheses)
     const res = await memPost('memory.retrieve', {
       filters: {},
       limit: limit || 200,
       sortBy: 'created_at',
       sortOrder: 'DESC',
     });
-    return res && res.data && res.data.memories ? res.data.memories : [];
+    const memories = res && res.data && res.data.memories ? res.data.memories : [];
+
+    // Episodic screen activity — lives in episodic_memory, not memory.
+    // Without this fetch the synthesis pipeline is blind to screen activity.
+    const epRes = await memPost('episodic.recent', {
+      limit: 100,
+      maxAgeDays: 2,
+    });
+    const episodic = epRes && epRes.data && epRes.data.memories ? epRes.data.memories : [];
+
+    return memories.concat(episodic);
   } catch (e) {
     logger.warn('[SynthesisAgent] fetchRecentMemories failed', { error: e.message });
     return [];
