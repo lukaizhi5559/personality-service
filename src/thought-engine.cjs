@@ -52,9 +52,22 @@ const SHADOW_REARM_MS = parseInt(process.env.THOUGHT_SHADOW_REARM_MS, 10) || 60 
 
 // Silence taxonomy windows
 const SILENCE_MS = parseInt(process.env.THOUGHT_SILENCE_MS, 10) || 3 * 60 * 1000;   // quiet since last prompt
+// Attributable-silence fast path: the assistant's last turn ended in a question
+// and the user went quiet — nudge on a seconds cadence, not the 3-min episode
+// cadence ordinary silence uses. A dedicated ~5s scan interval calls
+// silenceTick(); its early exits are pure timestamp math so the cost is nil.
+const SILENCE_SCAN_MS = parseInt(process.env.THOUGHT_SILENCE_SCAN_MS, 10) || 5000;   // how often silenceTick runs
+const ATTRIB_FIRST_MS = parseInt(process.env.THOUGHT_ATTRIB_FIRST_MS, 10) || 10000;  // first eval ~10s after the question
+const ATTRIB_NUDGE_MS = parseInt(process.env.THOUGHT_ATTRIB_NUDGE_MS, 10) || 20000;  // between nudges ~20s
+const ATTRIB_TRACE = parseFloat(process.env.THOUGHT_ATTRIB_TRACE || '1.1');          // ep-1 trace → crosses τ at creation
+const ENGAGED_NUDGE_MS = parseInt(process.env.THOUGHT_ENGAGED_NUDGE_MS, 10) || 45000; // engaged-session eval cadence
+const ENGAGED_TRACE_W = parseFloat(process.env.THOUGHT_ENGAGED_TRACE_W) || 0.2;      // silence trace added to the active topic
+const ENGAGED_TOPIC_MS = parseInt(process.env.THOUGHT_ENGAGED_TOPIC_MS, 10) || 15 * 60 * 1000; // topic freshness window
+const ENGAGED_CONVO_BOOST = process.env.THOUGHT_ENGAGED_CONVO_BOOST !== '0'; // engaged silence pushes the session's thought past τ in one eval
+const ENGAGED_MAX_BOOSTS = parseInt(process.env.THOUGHT_ENGAGED_MAX_BOOSTS, 10) || 3; // per-thought silence-boost cap
 const IDLE_MS = parseInt(process.env.THOUGHT_IDLE_MS, 10) || 15 * 60 * 1000;        // no prompt AND no monitor events
 const PAUSE_SUPPRESS_MS = parseInt(process.env.THOUGHT_PAUSE_SUPPRESS_MS, 10) || 10 * 60 * 1000;
-const MAX_SILENCE_EPISODES = 3; // escalation cap — humans stop saying "hello?" too
+const MAX_SILENCE_EPISODES = parseInt(process.env.THOUGHT_MAX_SILENCE_EPISODES, 10) || 4; // hard cap on the nudge chain — the LLM can stand down earlier
 
 // Presence: user considered active if any input/monitor event within this window
 const PRESENCE_MS = parseInt(process.env.THOUGHT_PRESENCE_MS, 10) || 7 * 60 * 1000;
@@ -128,7 +141,11 @@ const state = {
   lastIdleScanAt: 0,
   lastTriggerAt: 0,
   silenceEpisode: 0,        // consecutive unanswered-silence episodes
+  engagedBoosts: new Map(), // thoughtId → engaged-silence boost count (cap per thought)
   nextSilenceEvalAt: 0,     // re-arm cadence — continued quiet re-evaluates each window
+  attribNextAt: 0,          // attributable-silence fast-path cadence (seconds-scale)
+  silenceTrigAt: new Map(), // per-thought last silence-nudge fire — allows ep2/ep3 re-fires
+  silenceBusy: false,       // reentrancy guard for silenceTick
   pauseSuppressedUntil: 0,
   pendingDeliveries: [],    // held notify/question payloads (deliver-on-wake)
   recentNudges: [],         // phrasing history for escalation
@@ -144,12 +161,13 @@ function now() { return Date.now(); }
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
-function postJson(port, path, body, timeoutMs = 30000) {
+function postJson(port, path, body, timeoutMs = 30000, extraHeaders = null) {
   return new Promise((resolve) => {
     const data = JSON.stringify(body || {});
+    const headers = { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) };
+    if (extraHeaders) Object.assign(headers, extraHeaders);
     const req = http.request({
-      hostname: 'localhost', port, path, method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) },
+      hostname: 'localhost', port, path, method: 'POST', headers,
     }, (res) => {
       let raw = '';
       res.on('data', c => (raw += c));
@@ -164,9 +182,10 @@ function postJson(port, path, body, timeoutMs = 30000) {
   });
 }
 
+const CONV_API_KEY = process.env.MCP_CONVERSATION_API_KEY || process.env.MCP_API_KEY || '';
 const convPost = (action, payload) => postJson(CONV_PORT, `/${action}`, {
   version: 'mcp.v1', service: 'conversation', action, payload, requestId: `thought-${Date.now()}`,
-});
+}, 30000, CONV_API_KEY ? { Authorization: `Bearer ${CONV_API_KEY}` } : null);
 const commsPost = (path, body) => postJson(COMMS_PORT, path, body);
 const mainPost = (path, body) => postJson(MAIN_PORT, path, body, 5000);
 
@@ -237,11 +256,17 @@ async function onPrompt({ text, sessionId }) {
   if (sessionId) state.lastSessionId = sessionId;
   // Any user input ends the quiet period and resets the escalation chain
   state.silenceEpisode = 0;
+  state.engagedBoosts.clear();
   state.nextSilenceEvalAt = 0;
+  state.attribNextAt = 0;
+  state.silenceTrigAt.clear();
   state.recentNudges = [];
   if (PAUSE_RE.test(text)) {
     state.pauseSuppressedUntil = now() + PAUSE_SUPPRESS_MS;
   }
+  // User spoke — any open silence-nudge card is answered → complete it so it
+  // leaves Live and lands in Completed Actions.
+  closeOpenSilenceNudges().catch(() => {});
   await flushPending();
 
   // Explicit watch request — a user command, not a proactive trigger, so it
@@ -357,6 +382,16 @@ function onMonitor({ eventType, info }) {
  */
 async function extractCandidate(sourceKind, text) {
   const truncated = String(text).slice(0, 6000);
+  const silenceBlock = sourceKind === 'silence' ? `,
+  "silence": {
+    "nudge": true|false,           // is reaching out right now appropriate at all?
+    "urgency": "low|normal|high",  // deadline/time-pressure → high; sensitive or casual → low
+    "waitSec": 20-300,             // seconds before the next silence check-in eval
+    "standDown": false,            // true = graceful "I'll be on standby" moment, stop nudging after
+    "register": "one-line tone guidance (e.g. 'playful', 'gentle — topic seems personal')"
+  }` : '';
+  const silenceRules = sourceKind === 'silence' ? `
+- silence verdict: judge like a human deciding whether to follow up. A sensitive or emotional topic may deserve restraint (nudge:false or low urgency + long waitSec). A mentioned deadline, appointment, or urgent task deserves urgency:high and a short waitSec. After several ignored nudges, prefer standDown:true over another ping. waitSec is seconds (15 minimum, 300 max).` : '';
   const prompt = `You extract a concise "thought candidate" from ${sourceKind} input observed on the user's computer.
 Return JSON ONLY:
 {
@@ -364,31 +399,42 @@ Return JSON ONLY:
   "entities": ["key nouns — people, orgs, products, projects, topics (max 6)"],
   "actions": ["verbs — what the user is doing (max 4)"],
   "contextScore": 0.0-1.0,
-  "timeSensitive": true|false
+  "timeSensitive": true|false${silenceBlock}
 }
 Rules:
 - contextScore: 0 if the input is trivial/noise (acknowledgements like "ok", "one moment"; idle screens; login screens). 1.0 = clearly meaningful activity worth remembering.
 - timeSensitive: true ONLY if the state is transient and resolves within minutes (download/build/generation in progress, payment processing, error dialog, live call). Interests and research are NOT time-sensitive.
-- summary must be specific, never generic ("user browsing a page" → score 0).`;
+- summary must be specific, never generic ("user browsing a page" → score 0).${silenceRules}`;
 
   const out = await heartbeat.askLLMJson(prompt, truncated);
   if (!out || typeof out !== 'object') return null;
   if (!out.summary || typeof out.summary !== 'string') return null;
+  const s = out.silence && typeof out.silence === 'object' ? out.silence : null;
   return {
     summary: out.summary.trim(),
     entityNames: Array.isArray(out.entities) ? out.entities.slice(0, 8).map(String) : [],
     actionNames: Array.isArray(out.actions) ? out.actions.slice(0, 6).map(String) : [],
     contextScore: Math.max(0, Math.min(1, Number(out.contextScore ?? 0.5))),
     timeSensitive: out.timeSensitive === true,
+    silence: s ? {
+      nudge: s.nudge !== false,
+      urgency: ['low', 'normal', 'high'].includes(s.urgency) ? s.urgency : 'normal',
+      waitSec: Math.max(15, Math.min(300, Number(s.waitSec) || ATTRIB_NUDGE_MS / 1000)),
+      standDown: s.standDown === true,
+      register: typeof s.register === 'string' ? s.register.slice(0, 120) : '',
+    } : null,
   };
 }
 
-async function upsertCandidate(input, cand, { srcIds = [], silenceEpisode = 0, forceNew = false } = {}) {
+async function upsertCandidate(input, cand, { srcIds = [], silenceEpisode = 0, forceNew = false, urgent = false } = {}) {
   // Time-critical candidates enter with a big trace; ordinary ones scale by
   // context judgment. contextScore≈0 (pauses, noise) makes the trace ~0.
   let w = TRACE_WEIGHT[input] ?? 0.3;
   w *= Math.max(0.05, cand.contextScore);
   if (cand.timeSensitive) w = Math.max(w, TIME_SENSITIVE_WEIGHT * cand.contextScore);
+  // Urgent candidates (attributable silence) enter already over τ — a nudge's
+  // value decays in seconds, waiting for accumulation defeats the purpose.
+  if (urgent) w = Math.max(w, ATTRIB_TRACE);
   // Silence escalation: each continued unanswered episode weighs more — a
   // single stretch stays a watched thought, sustained silence crosses τ.
   if (input === 'silence' && silenceEpisode > 1) {
@@ -409,6 +455,11 @@ async function upsertCandidate(input, cand, { srcIds = [], silenceEpisode = 0, f
   const data = res?.data || res;
   if (data?.thought) {
     emitThoughtEvent(data.matched ? 'reinforced' : 'created', data.thought);
+    // Urgent candidates don't wait for the 60s tick — evaluate the trigger
+    // immediately so a nudge can land seconds after the silence is detected.
+    if ((urgent || cand.timeSensitive) && data.thought.score >= TRIGGER_SCORE) {
+      await maybeTriggerUrgent(data.thought);
+    }
   }
   return data || { matched: false };
 }
@@ -427,6 +478,18 @@ async function upsertCandidate(input, cand, { srcIds = [], silenceEpisode = 0, f
  *   extended absence  user away/asleep → triggered actions execute, delivery held
  */
 async function silenceTick() {
+  // Reentrancy guard — interval + any other caller must not interleave on the
+  // awaits inside (attribNextAt gate, extraction, upsert).
+  if (state.silenceBusy) return;
+  state.silenceBusy = true;
+  try {
+    await _silenceTickBody();
+  } finally {
+    state.silenceBusy = false;
+  }
+}
+
+async function _silenceTickBody() {
   const t = now();
   const sincePrompt = t - state.lastUserPromptAt;
   const sinceMonitor = t - state.lastMonitorEventAt;
@@ -438,6 +501,89 @@ async function silenceTick() {
   //    work. Screen input owns this; never nudge a focused user. ──────────
   const busyWorking = sincePrompt > SILENCE_MS && sinceMonitor < SILENCE_MS;
   if (busyWorking) return;
+
+  // ── Attributable fast path: assistant's last turn asked a question and the
+  //    user went quiet — nudge on a seconds cadence, not the 3-min episode
+  //    cadence ordinary silence uses. Runs on the dedicated ~5s scan interval;
+  //    the conv fetch only happens when an eval is actually due. ──────────
+  if (
+    state.lastUserPromptAt &&
+    sincePrompt >= ATTRIB_FIRST_MS &&
+    sincePrompt < IDLE_MS &&
+    t >= state.attribNextAt &&
+    state.silenceEpisode < MAX_SILENCE_EPISODES
+  ) {
+    const lastAssistant = await fetchLastAssistantTurn();
+    const attributable = /\?\s*$/.test(lastAssistant || '');
+    console.log(`[ThoughtEngine] Silence eval (${Math.round(sincePrompt / 1000)}s quiet) — lastAssistant=${lastAssistant ? `"${lastAssistant.slice(-60)}"` : '(none)'} attributable=${attributable}`);
+    if (attributable) {
+      const episode = state.silenceEpisode + 1;
+      const pendingQ = lastAssistant.slice(-160).trim();
+      const { mood_label } = await getMoodContext().catch(() => ({}));
+      const contextText = `The user's last message was "${state.lastUserText.slice(0, 300)}". ` +
+        `The assistant asked a question that is still unanswered: "${pendingQ}". ` +
+        `${Math.round(sincePrompt / 1000)}s of silence have passed. ` +
+        `This is unanswered-question episode #${episode} (hard cap ${MAX_SILENCE_EPISODES}). ` +
+        (episode > 1 ? `Previous nudges already sent: ${state.recentNudges.join(' | ') || 'none'}. ` : '') +
+        (mood_label ? `Current mood: ${mood_label}. ` : '') +
+        `Judge like a human whether to follow up now, how urgently, and whether it's time to stand down.`;
+      const cand = await extractCandidate('silence', contextText);
+      if (!cand) {
+        console.log('[ThoughtEngine] Attributable silence — extraction returned no candidate');
+        state.attribNextAt = t + ATTRIB_NUDGE_MS;
+        return;
+      }
+      const verdict = cand.silence || {};
+      console.log(`[ThoughtEngine] Silence verdict ep${episode}: ${JSON.stringify(verdict)}`);
+      // LLM-paced cadence inside bounds — a deadline gets fast re-arms, a
+      // sensitive topic gets breathing room. urgency:high hard-caps the wait
+      // at 30s so real deadlines can't be talked into a 2-min hold.
+      const waitSec = verdict.urgency === 'high'
+        ? Math.min(verdict.waitSec || 20, 30)
+        : (verdict.waitSec || ATTRIB_NUDGE_MS / 1000);
+      state.attribNextAt = t + waitSec * 1000;
+      // standDown is checked BEFORE the hold: "time to stand down" IS the
+      // final delivery ("I'll be on standby"), not a reason to go quiet.
+      if (verdict.nudge === false && verdict.standDown !== true) {
+        console.log(`[ThoughtEngine] Silence verdict: hold — no nudge this eval (re-check in ${waitSec}s)`);
+        return;
+      }
+      state.silenceEpisode += 1;
+      const ep = state.silenceEpisode;
+      const finalEpisode = ep >= MAX_SILENCE_EPISODES || verdict.standDown === true;
+      cand.contextScore = Math.min(1, cand.contextScore * 0.5 + 0.85 * 0.5);
+      const register = verdict.register ? ` Register: ${verdict.register}.` : '';
+      const summary = finalEpisode
+        ? `Politely stand down — let the user know you'll be on standby and they can ping you anytime (their unanswered question was "${pendingQ}")`
+        : ep > 1
+          ? `Check in again about the unanswered question "${pendingQ}" — warm, casual, human nudge #${ep}; vary the wording, don't repeat earlier nudges.${register}`
+          : `Awaiting answer to: "${pendingQ}".${register}`;
+      await upsertCandidate('silence', {
+        ...cand,
+        summary,
+        // Silence quotes the user's last message, so extraction inherits
+        // topic entities — drop them or silence evidence cross-merges.
+        entityNames: [],
+        actionNames: cand.actionNames,
+        timeSensitive: true,
+      }, { silenceEpisode: ep, urgent: true });
+      return; // attributable path owns this eval window
+    }
+    // Engaged silence: the assistant spoke recently (but didn't ask anything)
+    // and the user went quiet mid-session — the quiet is evidence for the
+    // ACTIVE TOPIC, not a standalone "hasn't responded" card. Reinforce the
+    // freshest live topic thought on a faster cadence so warm topics cross τ.
+    if (lastAssistant && state.silenceEpisode < MAX_SILENCE_EPISODES) {
+      state.attribNextAt = t + ENGAGED_NUDGE_MS;
+      if (await reinforceActiveTopic(ENGAGED_TRACE_W)) {
+        state.silenceEpisode += 1;
+        return;
+      }
+    }
+    // Not attributable (or extraction returned nothing) — don't re-fetch every
+    // scan tick; fall back to the ordinary 3-min cadence for this quiet stretch.
+    state.attribNextAt = t + SILENCE_MS;
+  }
 
   // ── True idle / extended absence: no comms AND no screen activity →
   //    silence-as-occasion: run the reflection/insight scan (rate-limited) ─
@@ -489,7 +635,66 @@ async function silenceTick() {
     // entities — drop them or silence evidence cross-merges into topic thoughts.
     entityNames: [],
     actionNames: cand.actionNames,
-  }, { silenceEpisode: episode, forceNew: state.recentNudges.length > 0 });
+  }, { silenceEpisode: episode });
+}
+
+/**
+ * Engaged-silence reinforcement: the session was recently active (assistant
+ * replied, user went quiet) — treat the quiet as evidence for the freshest
+ * live TOPIC thought rather than spawning a standalone silence card. Adds a
+ * small silence trace; if that crosses τ the urgent path fires immediately
+ * and the LLM assigns a contextual action (about the topic, not "you there?").
+ * Returns true when a topic thought was reinforced.
+ */
+async function reinforceActiveTopic(w) {
+  const res = await heartbeat.memPost('thought.list', {
+    userId: USER_ID, statuses: ['thought', 'triggered'], limit: 30,
+  });
+  const thoughts = res?.data?.thoughts || res?.thoughts || [];
+  const cutoff = now() - ENGAGED_TOPIC_MS;
+  const candidates = thoughts
+    .filter(th => th.input !== 'silence' && th.score > 0
+      && new Date(th.updatedAt || th.createdAt).getTime() > cutoff)
+    .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  // The CONVERSATION's own thought (from this session's prompt) is the engaged
+  // topic — quiet mid-conversation is evidence for it, not whatever the
+  // monitor happened to update most recently (e.g. a background YouTube tab).
+  const convo = candidates.find(th => th.input === 'prompt' && state.lastSessionId
+    && Array.isArray(th.sources) && th.sources.includes(state.lastSessionId));
+  // Cap boosts per thought — an abandoned topic drifting +0.2 forever would
+  // eventually cross τ and dispatch stale work (the LIDA case).
+  const underCap = th => (state.engagedBoosts.get(th.id) || 0) < ENGAGED_MAX_BOOSTS;
+  const topic = (convo && underCap(convo) ? convo : null) || candidates.filter(underCap)[0];
+  if (!topic) return false;
+  state.engagedBoosts.set(topic.id, (state.engagedBoosts.get(topic.id) || 0) + 1);
+  // Conversational silence is urgent like attributable silence: a human would
+  // follow up within seconds, not minutes. Boost the conversation's thought
+  // past τ on the first engaged eval so maybeTriggerUrgent fires now — the
+  // LLM then assigns a contextual action ("still there?") instead of waiting
+  // for slow accumulation. Other topics keep the gentle +w drift.
+  const boost = topic === convo && ENGAGED_CONVO_BOOST
+    ? Math.min(1.0, Math.max(w, TRIGGER_SCORE + 0.05 - (topic.score || 0)))
+    : w;
+  await heartbeat.memPost('thought.update', {
+    id: topic.id,
+    trace: { w: boost, input: 'silence', srcIds: state.lastSessionId ? [state.lastSessionId] : [] },
+  });
+  const boosted = { ...topic, score: (topic.score || 0) + boost };
+  console.log(`[ThoughtEngine] Engaged silence +${boost.toFixed(2)} → ${topic.id} (score≈${boosted.score.toFixed(2)})${topic === convo ? ' [conversation]' : ''} "${topic.summary.slice(0, 60)}"`);
+  await maybeTriggerUrgent(boosted);
+  return true;
+}
+
+/** A new user prompt answers any open silence-nudge cards — mark them done. */
+async function closeOpenSilenceNudges() {
+  const res = await heartbeat.memPost('thought.list', { userId: USER_ID, statuses: ['triggered'], limit: 20 });
+  const open = (res?.data?.thoughts || res?.thoughts || []).filter(t => t.input === 'silence');
+  for (const t of open) {
+    await heartbeat.memPost('thought.update', {
+      id: t.id, updates: { status: 'completed', outcomeText: 'user responded' },
+    });
+    emitThoughtEvent('completed', { ...t, status: 'completed' });
+  }
 }
 
 async function fetchLastAssistantTurn() {
@@ -564,34 +769,68 @@ async function evaluateTriggers() {
 
   for (const thought of ready) {
     state.lastTriggerAt = t;
-    if (SHADOW) {
-      // Run action assignment (no gates, no execution) so the shadow log shows
-      // WHAT would happen — not just that it would trigger.
-      const action = await assignAction(thought);
-      if (LIVE_ACTIONS.has(action.type)) {
-        // Whitelisted action — executes for real through the normal gated path.
-        console.log(`[ThoughtEngine:SHADOW] Live action ${action.type} whitelisted → executing for ${thought.id}`);
-        await trigger(thought, action);
-        continue;
-      }
-      state.shadowFiredAt.set(thought.id, t);
-      const entry = { ts: t, thoughtId: thought.id, score: thought.score, summary: thought.summary, action };
-      state.shadowLog.push(entry);
-      if (state.shadowLog.length > 200) state.shadowLog.shift();
-      console.log(`[ThoughtEngine:SHADOW] Would trigger ${thought.id} score=${thought.score.toFixed(2)} → ${action.type} (${action.reason || 'no reason'}) "${thought.summary}"`);
-      // UI preview: Brain card shows what it would have done (in-memory, no DB).
-      emitThoughtEvent('shadow', {
-        ...thought,
-        shadowAction: {
-          type: action.type,
-          text: action.payload?.text || action.payload?.prompt || action.payload?.memory || '',
-          reason: action.reason || '',
-        },
-      });
-      continue;
-    }
-    await trigger(thought);
+    await _fireOne(thought);
   }
+}
+
+/** Fire a single thought's trigger — shared by evaluateTriggers and
+ *  maybeTriggerUrgent. touchCooldown: silence nudges do NOT consume the global
+ *  15-min cooldown (their cadence is governed by episode + per-thought re-arm). */
+async function _fireOne(thought, { touchCooldown = true } = {}) {
+  const t = now();
+  if (touchCooldown) state.lastTriggerAt = t;
+  if (SHADOW) {
+    // Run action assignment (no gates, no execution) so the shadow log shows
+    // WHAT would happen — not just that it would trigger.
+    const action = await assignAction(thought);
+    // 'skip' is inert — its "execution" only retires the thought (status →
+    // expired). Running it for real keeps shadow-mode Live lists from filling
+    // with over-τ thoughts the LLM already judged unactionable.
+    if (LIVE_ACTIONS.has(action.type) || action.type === 'skip') {
+      console.log(`[ThoughtEngine:SHADOW] Live action ${action.type} ${LIVE_ACTIONS.has(action.type) ? 'whitelisted' : 'inert-skip'} → executing for ${thought.id}`);
+      await trigger(thought, action);
+      return;
+    }
+    state.shadowFiredAt.set(thought.id, t);
+    const entry = { ts: t, thoughtId: thought.id, score: thought.score, summary: thought.summary, action };
+    state.shadowLog.push(entry);
+    if (state.shadowLog.length > 200) state.shadowLog.shift();
+    console.log(`[ThoughtEngine:SHADOW] Would trigger ${thought.id} score=${thought.score.toFixed(2)} → ${action.type} (${action.reason || 'no reason'}) "${thought.summary}"`);
+    // UI preview: Brain card shows what it would have done (in-memory, no DB).
+    emitThoughtEvent('shadow', {
+      ...thought,
+      shadowAction: {
+        type: action.type,
+        text: action.payload?.text || action.payload?.prompt || action.payload?.memory || '',
+        reason: action.reason || '',
+      },
+    });
+    return;
+  }
+  await trigger(thought);
+}
+
+/**
+ * Urgent-path trigger eval for a single thought — called right after an
+ * upsert crosses τ instead of waiting for the 60s tick. Handles the silence
+ * re-fire case: a thought already 'triggered' may fire again while the
+ * unanswered-question episode chain is still growing (nudge 2, 3), gated by
+ * a per-thought nudge re-arm rather than the global cooldown.
+ */
+async function maybeTriggerUrgent(thought) {
+  const t = now();
+  if (!thought?.id || thought.score < TRIGGER_SCORE) return;
+  if (thought.snoozedUntil && new Date(thought.snoozedUntil).getTime() > t) return;
+  if (SHADOW && t - (state.shadowFiredAt.get(thought.id) || 0) < SHADOW_REARM_MS) return;
+
+  const isSilence = thought.input === 'silence';
+  const silenceRefire = isSilence && thought.status === 'triggered'
+    && (thought.silenceEpisode || 0) < MAX_SILENCE_EPISODES
+    && t - (state.silenceTrigAt.get(thought.id) || 0) >= ATTRIB_NUDGE_MS;
+  if (thought.status !== 'thought' && !silenceRefire) return;
+
+  if (isSilence) state.silenceTrigAt.set(thought.id, t);
+  await _fireOne(thought, { touchCooldown: !isSilence });
 }
 
 /** Constrained LLM action assignment — shared by trigger() and shadow eval. */
@@ -625,7 +864,8 @@ ACTION VOCABULARY (choose exactly one):
 - "skip": triggered but no useful action right now — let it expire quietly. payload: {"reason": "why"}
 
 Rules:
-- Prefer "skip" if acting would interrupt without clear value — a quiet miss beats a noisy interruption.
+- Prefer "skip" if acting would interrupt without clear value — a quiet miss beats a noisy interruption.${thought.input === 'silence' ? `
+- This is an unanswered-question follow-up — the user went quiet mid-conversation, so a gentle check-in is usually the right action; only "skip" if a nudge would be clearly wrong.` : ''}
 - If the user is INACTIVE, still pick the action — delivery is handled separately.
 - Match the persona's tone (see context above). If phrasing includes faith-sensitive content, keep it gentle and caring.
 Return JSON ONLY: {"type":"...","payload":{...},"reason":"one sentence why","urgency":"low|medium|high","needsApproval":false}`;
@@ -765,10 +1005,18 @@ async function executeAction(thought, action) {
       outcomeText = 'unhandled action type';
   }
 
+  // Silence questions keep the card 'triggered' (not terminal) while the
+  // episode chain is open — 'triggered' is matchable, so the next nudge's
+  // trace reinforces THIS card instead of spawning a duplicate, and the
+  // silenceTrigAt path can refire it. Final episode (or non-silence) completes.
+  const keepOpen = thought.input === 'silence' && action.type === 'question'
+    && (thought.silenceEpisode || 0) < MAX_SILENCE_EPISODES;
+  const finalStatus = keepOpen ? 'triggered' : 'completed';
   await heartbeat.memPost('thought.update', {
-    id: thought.id, updates: { status: 'completed', action, outcomeText },
+    id: thought.id, updates: { status: finalStatus, action, outcomeText },
   });
-  emitThoughtEvent('completed', { ...thought, status: 'completed', action }, { outcomeText });
+  emitThoughtEvent(finalStatus === 'triggered' ? 'triggered' : 'completed',
+    { ...thought, status: finalStatus, action }, { outcomeText });
 }
 
 /**
@@ -780,6 +1028,17 @@ async function correlateTaskResult(taskId, status, result) {
   if (!link) return;
   state.taskToThought.delete(taskId);
   let artifacts = [];
+  // The dispatched agent often returns text without writing files — persist
+  // the result ourselves so every prompt action leaves a real artifact note.
+  if (status === 'done' && result) {
+    try {
+      fs.mkdirSync(link.outDir, { recursive: true });
+      const notePath = path.join(link.outDir, 'result.md');
+      if (!fs.existsSync(notePath) || fs.readdirSync(link.outDir).filter(f => f !== 'result.md').length === 0) {
+        fs.writeFileSync(notePath, String(result));
+      }
+    } catch (_) {}
+  }
   try {
     artifacts = fs.readdirSync(link.outDir, { withFileTypes: true })
       .filter(d => d.isFile())
@@ -970,6 +1229,18 @@ async function deliver(d) {
   // voice only for medium/high urgency (JITIR: default delivery is ignorable).
   emitThoughtEvent(d.kind === 'question' ? 'question' : 'notify',
     { id: d.thoughtId, action: { type: d.kind }, summary: d.text });
+  // Record delivered outreach as the assistant's last turn — a delivered
+  // question becomes attributable (the silence chain escalates it), and a
+  // stand-down notify ends the loop cleanly (no trailing "?").
+  if (state.lastSessionId) {
+    try {
+      await convPost('message.add', {
+        sessionId: state.lastSessionId, sender: 'assistant', text: d.text,
+      });
+    } catch (e) {
+      console.warn('[ThoughtEngine] message.add for nudge failed:', e.message);
+    }
+  }
   if (d.urgency !== 'low' && !inQuietHours()) {
     await heartbeat.voiceSpeak(d.text);
   }
@@ -985,10 +1256,11 @@ async function flushPending() {
 
 /** Approve/dismiss/snooze a thought (Brain tab buttons). */
 async function decide(thoughtId, decision, options = {}) {
-  // Snooze applies to live thoughts, not just approval cards — look wider.
-  const statuses = decision === 'snooze'
-    ? ['thought', 'triggered', 'awaiting_approval']
-    : ['awaiting_approval'];
+  // Approve applies to approval cards only; snooze/dismiss apply to any live
+  // thought (the Brain tab dismisses live thoughts, not just approvals).
+  const statuses = decision === 'approve'
+    ? ['awaiting_approval']
+    : ['thought', 'triggered', 'awaiting_approval'];
   const res = await heartbeat.memPost('thought.list', { userId: USER_ID, statuses, limit: 100 });
   const thoughts = res?.data?.thoughts || res?.thoughts || [];
   const thought = thoughts.find(t => t.id === thoughtId);
@@ -1008,9 +1280,9 @@ async function decide(thoughtId, decision, options = {}) {
     return { ok: true, executed: true };
   }
   await heartbeat.memPost('thought.update', {
-    id: thoughtId, updates: { status: 'expired', outcomeText: 'dismissed by user' },
+    id: thoughtId, updates: { status: 'dismissed', outcomeText: 'dismissed by user' },
   });
-  emitThoughtEvent('expired', { ...thought, status: 'expired' });
+  emitThoughtEvent('dismissed', { ...thought, status: 'dismissed' });
   return { ok: true, executed: false };
 }
 
@@ -1020,11 +1292,8 @@ async function decide(thoughtId, decision, options = {}) {
 
 async function tick() {
   if (!ENABLED) return;
-  try {
-    await silenceTick();
-  } catch (e) {
-    console.warn('[ThoughtEngine] silenceTick failed:', e.message);
-  }
+  // silenceTick is owned by the dedicated SILENCE_SCAN_MS interval — calling it
+  // here too races the 5s scan on the attribNextAt gate (duplicate evals).
   try {
     await evaluateTriggers();
   } catch (e) {
@@ -1047,8 +1316,14 @@ function start() {
   }
   if (state.started) return;
   state.started = true;
-  console.log(`[ThoughtEngine] Starting (tick ${TICK_MS}ms, τ=${TRIGGER_SCORE}, shadow=${SHADOW})`);
+  console.log(`[ThoughtEngine] Starting (tick ${TICK_MS}ms, silence scan ${SILENCE_SCAN_MS}ms, τ=${TRIGGER_SCORE}, shadow=${SHADOW})`);
   state.tickTimer = setInterval(() => tick().catch(() => {}), TICK_MS);
+  // Dedicated fast cadence for the silence producer — attributable nudges run
+  // on seconds, not the 60s engine tick. silenceTick's early exits are cheap
+  // timestamp math; the conv fetch only runs when an eval is actually due.
+  state.silenceScanTimer = setInterval(
+    () => silenceTick().catch(e => console.warn('[ThoughtEngine] silenceTick failed:', e?.message || e)),
+    SILENCE_SCAN_MS);
 
   // Hydrate watches that survived a restart (persisted as 'watching' rows).
   heartbeat.memPost('thought.list', { userId: USER_ID, statuses: ['watching'], limit: WATCH_MAX })
@@ -1066,6 +1341,8 @@ function stop() {
   state.started = false;
   if (state.tickTimer) clearInterval(state.tickTimer);
   state.tickTimer = null;
+  if (state.silenceScanTimer) clearInterval(state.silenceScanTimer);
+  state.silenceScanTimer = null;
 }
 
 module.exports = {
