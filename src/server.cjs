@@ -25,6 +25,7 @@ const http       = require('http');
 const emotionEngine  = require('./emotion-engine.cjs');
 const personalityDoc = require('./personality-doc.cjs');
 const heartbeat      = require('./heartbeat.cjs');
+const thoughtEngine  = require('./thought-engine.cjs');
 const logger         = require('./logger.cjs');
 
 const PORT         = parseInt(process.env.PORT || '3008', 10);
@@ -127,6 +128,12 @@ async function handleRequest(req, res) {
     'personality.getTraits',
     'personality.upsertTrait',
     'personality.getOverlay',
+    // Thought/Trigger engine storage routes (user-memory)
+    'thought.list',
+    'thought.get',
+    'thought.upsert',
+    'thought.update',
+    'thought.purge',
   ];
 
   if (forwardedActions.includes(action)) {
@@ -180,6 +187,12 @@ async function handleRequest(req, res) {
     const eventType = payload?.eventType;
     const info = payload?.info || {};
     logger.info(`[PersonalityService] Monitor event received: ${eventType}`, info);
+    // Presence signal + dwell events feed the Thought engine
+    if (eventType === 'dwell') {
+      thoughtEngine.handleInput({ type: 'dwell', ...info }).catch(() => {});
+    } else {
+      thoughtEngine.handleInput({ type: 'monitor', eventType, info }).catch(() => {});
+    }
     // Trigger event-driven Tier 2 via the heartbeat module's debounce logic
     if (typeof heartbeat._scheduleEventTier2 === 'function') {
       heartbeat._scheduleEventTier2();
@@ -187,6 +200,33 @@ async function handleRequest(req, res) {
       heartbeat.runTier2().catch(() => {});
     }
     return jsonResponse(res, 200, { status: 'ok', message: `Monitor event ${eventType} received` });
+  }
+
+  // ── /thought.input — unified input for the Thought/Trigger engine ───────────
+  // Producers (comms-graph prompts, monitor dwell events) POST candidates here.
+  if (action === 'thought.input') {
+    const result = await thoughtEngine.handleInput(payload);
+    return jsonResponse(res, 200, {
+      version: 'mcp.v1',
+      service: 'personality-service',
+      action: 'thought.input',
+      requestId,
+      status: 'ok',
+      data: result,
+    });
+  }
+
+  // ── /thought.decide — approve/dismiss an awaiting_approval thought ──────────
+  if (action === 'thought.decide') {
+    const result = await thoughtEngine.decide(payload.id, payload.decision, payload);
+    return jsonResponse(res, 200, {
+      version: 'mcp.v1',
+      service: 'personality-service',
+      action: 'thought.decide',
+      requestId,
+      status: 'ok',
+      data: result,
+    });
   }
 
   // ── /heartbeat.tier3 — manual trigger for deep reflection (debug/testing) ────
@@ -216,11 +256,18 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log('     POST /personality.getOverlay');
   console.log('     POST /personality.overlay');
   console.log('     POST /personality.moodContext');
+  console.log('     POST /thought.input');
+  console.log('     POST /thought.decide');
+  console.log('     POST /thought.* (forwarded: list|get|upsert|update|purge)');
   console.log('     GET  /health\n');
 
   // Start heartbeat daemon
   heartbeat.start();
   logger.info('[PersonalityService] Heartbeat daemon started');
+
+  // Start Thought/Trigger engine
+  thoughtEngine.start();
+  logger.info('[PersonalityService] Thought engine started');
 });
 
 server.on('error', (err) => {
@@ -232,11 +279,13 @@ server.on('error', (err) => {
 process.on('SIGTERM', () => {
   logger.info('[PersonalityService] SIGTERM — shutting down');
   heartbeat.stop();
+  thoughtEngine.stop();
   server.close(() => process.exit(0));
 });
 
 process.on('SIGINT', () => {
   logger.info('[PersonalityService] SIGINT — shutting down');
   heartbeat.stop();
+  thoughtEngine.stop();
   server.close(() => process.exit(0));
 });

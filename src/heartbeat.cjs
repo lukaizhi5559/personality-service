@@ -167,6 +167,25 @@ async function askLLM(systemPrompt, userPrompt, timeoutMs) {
   }
 }
 
+/**
+ * askLLM variant that expects a JSON object response — strips code fences and
+ * parses. Returns null on parse failure (callers must tolerate null).
+ */
+async function askLLMJson(systemPrompt, userPrompt, timeoutMs) {
+  const raw = await askLLM(systemPrompt, userPrompt, timeoutMs);
+  if (!raw) return null;
+  try {
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    const start = cleaned.indexOf('{');
+    const end = cleaned.lastIndexOf('}');
+    if (start === -1 || end === -1) return null;
+    return JSON.parse(cleaned.slice(start, end + 1));
+  } catch (_) {
+    logger.debug('[Heartbeat] askLLMJson parse failed', { raw: raw.slice(0, 120) });
+    return null;
+  }
+}
+
 // ── Biblical best-interest gate ────────────────────────────────────────────────
 
 async function biblicalGate(actionDescription) {
@@ -229,109 +248,83 @@ async function runTier1() {
   }
 }
 
-// ── Tier 2: Awareness check (every 5 min) ──────────────────────────────────────
+// ── Tier 2: Thought judgment pass (every 5 min) ────────────────────────────────
+// Repointed at the Thought/Trigger engine (thought-engine.cjs): the old
+// "awareness check" invented proactive acts from raw memory digests on a timer.
+// Now judgment is applied as score traces on the persistent thought table —
+// sustained-interest boosts, stale/noise suppression. Proactive acting happens
+// through Thought → Trigger → action, not here.
+
+// Per-thought judgment cooldown — without it the 5-min pass re-judges the same
+// thought every run (observed: +0.20 ×9 on one thought, −0.20 ×4 on another).
+const JUDGE_COOLDOWN_MS = parseInt(process.env.THOUGHT_JUDGE_COOLDOWN_MS) || 2 * 60 * 60 * 1000; // 2h
+const _judgedAt   = new Map(); // thoughtId → last judgment ms
+const _judgeCount = new Map(); // thoughtId → total judgments applied
 
 async function runTier2() {
   try {
-    logger.debug('[Heartbeat:T2] Running awareness check');
-
-    // Fetch recent context
-    const [memoriesRes, stateRes] = await Promise.all([
-      memPost('memory.retrieve', { filters: {}, limit: 20, sortBy: 'created_at', sortOrder: 'DESC' }),
-      memPost('personality.getState', {}),
-    ]);
-
-    const memories = (memoriesRes && memoriesRes.data && memoriesRes.data.memories) ? memoriesRes.data.memories : [];
-    const state    = (stateRes && stateRes.data && stateRes.data.state) ? stateRes.data.state : { mood_label: 'content' };
-
-    if (memories.length === 0) {
-      logger.debug('[Heartbeat:T2] No memories — skipping awareness check');
+    const thoughtsRes = await memPost('thought.list', { userId: 'local_user', limit: 30 });
+    const allThoughts = (thoughtsRes && thoughtsRes.data && thoughtsRes.data.thoughts) ? thoughtsRes.data.thoughts : [];
+    if (allThoughts.length === 0) {
+      logger.debug('[Heartbeat:T2] No open thoughts — skipping judgment pass');
       return;
     }
 
-    // Build context digest for LLM
-    const now = new Date();
-    const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: true });
-    const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric' });
-
-    const memDigest = memories
-      .slice(0, 15)
-      .map(m => '[' + (m.type || 'memory') + '] ' + (m.source_text || m.extracted_text || '').slice(0, 150))
-      .filter(Boolean)
-      .join('\n');
-
-    const systemPrompt = 'You are ThinkDrop\'s autonomous awareness engine with a biblical worldview centered on Jesus Christ. ' +
-      'Your current emotional state is: ' + state.mood_label + '. ' +
-      'Review the recent observations and decide if ThinkDrop should proactively say or do something RIGHT NOW. ' +
-      'Consider: upcoming appointments, user inactivity patterns, interests, urgent needs. ' +
-      'Respond with a JSON object only:\n' +
-      '{\n' +
-      '  "action": "speak" | "act" | "skip",\n' +
-      '  "reason": "brief reason",\n' +
-      '  "content": "exact thing to say (if speak)",\n' +
-      '  "skill_name": "skill name (if act)",\n' +
-      '  "skill_args": {}\n' +
-      '}';
-
-    const userPrompt = 'Current time: ' + timeStr + ' on ' + dateStr + '\n\nRecent observations:\n' + memDigest;
-
-    const raw = await askLLM(systemPrompt, userPrompt, 25000);
-    if (!raw) return;
-
-    let decision;
-    try {
-      const jsonStr = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
-      decision = JSON.parse(jsonStr);
-    } catch (e) {
-      logger.debug('[Heartbeat:T2] Could not parse LLM decision', { raw: raw.slice(0, 100) });
+    // Only thoughts past their cooldown are eligible for re-judgment.
+    const nowMs = Date.now();
+    const thoughts = allThoughts.filter(t => nowMs - (_judgedAt.get(t.id) || 0) >= JUDGE_COOLDOWN_MS);
+    if (thoughts.length === 0) {
+      logger.debug('[Heartbeat:T2] All thoughts within judgment cooldown — skipping');
       return;
     }
 
-    if (!decision || decision.action === 'skip') {
-      logger.debug('[Heartbeat:T2] Decision: skip');
-      return;
+    const stateRes = await memPost('personality.getState', {});
+    const mood = (stateRes && stateRes.data && stateRes.data.state && stateRes.data.state.mood_label)
+      ? stateRes.data.state.mood_label : 'content';
+
+    const digest = thoughts.slice(0, 30).map(t =>
+      '- id=' + t.id + ' [' + t.input + '] score=' + Number(t.score).toFixed(2) +
+      ' "' + (t.summary || '').slice(0, 90) + '"' +
+      ' traces=' + (t.reinforcements || []).length +
+      ' age_h=' + Math.round((nowMs - new Date(t.createdAt).getTime()) / 3600000) +
+      ' judgments=' + (_judgeCount.get(t.id) || 0)
+    ).join('\n');
+
+    const systemPrompt =
+      'You are the judgment layer of a proactive desktop assistant with a biblical worldview centered on Jesus Christ. ' +
+      'Current mood: ' + mood + '. ' +
+      'Review these open thoughts (accumulated observations about the user) and decide if any deserve a score adjustment. ' +
+      'Score = sum of decaying evidence traces; trigger threshold is 1.0.\n' +
+      'Rules:\n' +
+      '- Boost (w +0.1 to +0.3) thoughts with sustained cross-modal evidence or clear user value ' +
+      '(recurring topic across days, time-sensitive unresolved item, appointment-like signals).\n' +
+      '- Suppress (w -0.1 to -0.3) thoughts that look like noise, one-off curiosities, or resolved items.\n' +
+      '- judgments=N is how many times this thought was already adjusted — do not re-adjust just to repeat a prior call.\n' +
+      '- Most ticks need NO adjustments — only act when a pattern is genuinely visible.\n' +
+      'Respond with JSON only: {"adjustments":[{"id":"th_...","w":0.0,"reason":"short"}]}';
+
+    const userPrompt = 'Open thoughts:\n' + digest;
+    const decision = await askLLMJson(systemPrompt, userPrompt, 25000);
+    if (!decision) return;
+
+    const adjustments = Array.isArray(decision.adjustments) ? decision.adjustments : [];
+    for (const adj of adjustments.slice(0, 10)) {
+      if (!adj || !adj.id || typeof adj.w !== 'number' || adj.w === 0) continue;
+      // Re-check cooldown at apply time — the digest was built before the LLM call.
+      if (Date.now() - (_judgedAt.get(adj.id) || 0) < JUDGE_COOLDOWN_MS) continue;
+      const w = Math.max(-0.5, Math.min(0.5, adj.w));
+      await memPost('thought.update', {
+        id: adj.id,
+        trace: { w, input: 'judgment', srcIds: [] },
+      }).catch(() => {});
+      _judgedAt.set(adj.id, Date.now());
+      _judgeCount.set(adj.id, (_judgeCount.get(adj.id) || 0) + 1);
+      logger.info('[Heartbeat:T2] Judgment ' + (w > 0 ? '+' : '') + w.toFixed(2) + ' → ' + adj.id + ': ' + (adj.reason || ''));
     }
-
-    // ── Biblical gate ─────────────────────────────────────────────────────────
-    const actionDesc = decision.action === 'speak'
-      ? 'ThinkDrop says to the user: ' + (decision.content || '')
-      : 'ThinkDrop executes skill: ' + (decision.skill_name || '') + ' — reason: ' + (decision.reason || '');
-
-    const allowed = await biblicalGate(actionDesc);
-    if (!allowed) {
-      logger.info('[Heartbeat:T2] Action blocked by biblical gate', { action: decision.action });
-      return;
-    }
-
-    // ── Execute ───────────────────────────────────────────────────────────────
-    if (decision.action === 'speak' && decision.content) {
-      logger.info('[Heartbeat:T2] Proactive speak', { content: decision.content.slice(0, 80) });
-      await voiceSpeak(decision.content);
-      await emotionEngine.applyEvent('discovery_made', 'heartbeat', 'Proactive awareness insight spoken');
-
-    } else if (decision.action === 'act' && decision.skill_name) {
-      logger.info('[Heartbeat:T2] Proactive act', { skill: decision.skill_name });
-      const result = await commandPost({
-        payload: {
-          skill: 'external.skill',
-          args: Object.assign({ skillName: decision.skill_name }, decision.skill_args || {}),
-        },
-        requestId: 'hb_act_' + Date.now(),
-      });
-
-      if (result && result.success !== false) {
-        await emotionEngine.applyEvent('proactive_act_done', 'heartbeat', 'Autonomous skill executed: ' + decision.skill_name);
-        // Notify user what was done
-        if (decision.content) {
-          await voiceSpeak(decision.content);
-        } else {
-          await voiceSpeak('I took care of something for you — ' + (decision.reason || 'just checking in on your behalf') + '.');
-        }
-      }
-    }
-
+    return;
   } catch (e) {
     logger.warn('[Heartbeat:T2] Error', { error: e.message });
+    return;
   }
 }
 
@@ -438,4 +431,9 @@ function stop() {
   logger.info('[Heartbeat] Stopped');
 }
 
-module.exports = { start, stop, runTier1, runTier1_5, runTier2, runTier3, subscribeToMonitor, _scheduleEventTier2 };
+module.exports = {
+  start, stop, runTier1, runTier1_5, runTier2, runTier3,
+  subscribeToMonitor, _scheduleEventTier2,
+  // Shared helpers for thought-engine.cjs
+  memPost, askLLM, askLLMJson, biblicalGate, voiceSpeak, commandPost,
+};
