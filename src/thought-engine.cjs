@@ -128,6 +128,38 @@ const ACTION_TYPES = ['notify', 'question', 'prompt', 'skill', 'remember', 'watc
 // prompt/skill/watch require approval until Phase-2 tiering is tuned.
 const AUTO_ALLOWED = new Set(['notify', 'question', 'remember', 'skip']);
 
+// Echo detection — a delivered message whose word set is mostly contained in
+// the assistant's last reply or a prior nudge is a parrot, not a follow-up.
+const ECHO_SIM = 0.6;
+
+// Entity matching for topic-context gathering — mirrors GENERIC_ENTITIES /
+// sharedEntityCount in user-memory's thoughts.js (separate process, can't import).
+const GENERIC_ENTITIES = new Set([
+  'browser', 'chrome', 'app', 'application', 'screen', 'window', 'page',
+  'website', 'site', 'computer', 'desktop', 'internet', 'online', 'file',
+  'files', 'text', 'code', 'unknown', 'other',
+]);
+function _sharedEntityCount(a, b) {
+  const setA = new Set((a || []).map(e => String(e).toLowerCase().trim()).filter(e => e && !GENERIC_ENTITIES.has(e)));
+  let n = 0;
+  for (const e of (b || []).map(x => String(x).toLowerCase().trim())) {
+    if (e && !GENERIC_ENTITIES.has(e) && setA.has(e)) n++;
+  }
+  return n;
+}
+
+function _wordContainment(a, b) {
+  const toks = s => new Set(
+    String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/).filter(w => w.length > 2)
+  );
+  const A = toks(a), B = toks(b);
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const w of A) if (B.has(w)) inter++;
+  return inter / Math.min(A.size, B.size);
+}
+
 // ---------------------------------------------------------------------------
 // Engine state
 // ---------------------------------------------------------------------------
@@ -346,8 +378,13 @@ async function onDwell({ app, filePath, windowTitle, url, dwellMs, startedAt }) 
 async function onQueue({ text, taskId, status, result }) {
   if (!text) return { ok: false, reason: 'empty' };
   // Task-completion correlation: if this task was dispatched by a thought's
-  // prompt action, stamp its outcome/artifacts back onto the thought.
-  if (taskId) await correlateTaskResult(taskId, status, result);
+  // prompt action, stamp its outcome/artifacts back onto the thought — and
+  // STOP there. Extracting a fresh candidate from the engine's own dispatched
+  // prompt+result would create an echo thought that re-triggers the same topic
+  // (engine output re-ingested as if it were new user evidence).
+  if (taskId && await correlateTaskResult(taskId, status, result)) {
+    return { ok: true, correlated: true };
+  }
 
   const cand = await extractCandidate('queue', `${text}${result ? `\nResult: ${result}` : ''}`);
   if (!cand) return { ok: false, reason: 'extract_null' };
@@ -514,7 +551,9 @@ async function _silenceTickBody() {
     state.silenceEpisode < MAX_SILENCE_EPISODES
   ) {
     const lastAssistant = await fetchLastAssistantTurn();
-    const attributable = /\?\s*$/.test(lastAssistant || '');
+    // Markdown-tolerant question check — turns often end "?**" (bold), `?"`,
+    // `?)` etc. Trailing emphasis/quotes/parens after the ? still count.
+    const attributable = /\?[\s*_`~'"”’)\].!?]*$/.test(lastAssistant || '');
     console.log(`[ThoughtEngine] Silence eval (${Math.round(sincePrompt / 1000)}s quiet) — lastAssistant=${lastAssistant ? `"${lastAssistant.slice(-60)}"` : '(none)'} attributable=${attributable}`);
     if (attributable) {
       const episode = state.silenceEpisode + 1;
@@ -526,7 +565,10 @@ async function _silenceTickBody() {
         `This is unanswered-question episode #${episode} (hard cap ${MAX_SILENCE_EPISODES}). ` +
         (episode > 1 ? `Previous nudges already sent: ${state.recentNudges.join(' | ') || 'none'}. ` : '') +
         (mood_label ? `Current mood: ${mood_label}. ` : '') +
-        `Judge like a human whether to follow up now, how urgently, and whether it's time to stand down.`;
+        `Judge like a human whether to follow up now, how urgently, and whether it's time to stand down. ` +
+        `A gentle check-in is the DEFAULT for casual conversation — the user is engaged with this assistant and a quick "still there?" is natural. ` +
+        `Only choose nudge:false for a clear reason (sensitive/emotional topic, user asked for space, late night). ` +
+        `For casual topics prefer waitSec 30-60 rather than a long hold.`;
       const cand = await extractCandidate('silence', contextText);
       if (!cand) {
         console.log('[ThoughtEngine] Attributable silence — extraction returned no candidate');
@@ -603,7 +645,9 @@ async function _silenceTickBody() {
 
   // Attributable check: did the assistant's last turn end in a question?
   const lastAssistant = await fetchLastAssistantTurn();
-  const attributable = /\?\s*$/.test(lastAssistant || '');
+  // Markdown-tolerant question check — assistant turns often end "?**" (bold),
+  // `?"`, `?)` etc. Trailing emphasis/quotes/parens after the ? still count.
+  const attributable = /\?[\s*_`~'"”’)\].!?]*$/.test(lastAssistant || '');
   // Post-answer lapse (assistant gave info, no question) is weak — context
   // scorer also damps it, but bias low from the start.
   const baseContext = attributable ? 0.7 : 0.25;
@@ -711,6 +755,105 @@ async function fetchLastAssistantTurn() {
   } catch (_) {
     return '';
   }
+}
+
+/**
+ * Topic evidence bundle — everything known about this thought's subject across
+ * all input streams, assembled at trigger time. Recall is tiered like human
+ * memory rather than a flat lookback window: working conversation (now),
+ * recent episodic captures (days, widened when thin), score-weighted live
+ * thoughts (reinforcement = impact = recall), unbounded semantic memory
+ * (relevance-gated, not clock-gated), and a callback into a past conversation
+ * when a related thought's sources point at one. Every source degrades to
+ * empty — evidence gathering must never block action assignment.
+ */
+async function gatherTopicContext(thought) {
+  const ctx = { lastAssistant: '', sessionTail: [], related: [], memories: [], captures: [], pastConvo: [] };
+  const isSilence = thought.input === 'silence';
+
+  // Working context — the current session's recent turns.
+  const msgRes = state.lastSessionId
+    ? await convPost('message.list', { sessionId: state.lastSessionId, limit: 8, direction: 'DESC' }).catch(() => null)
+    : null;
+  const msgs = msgRes?.data?.messages || msgRes?.result?.messages || [];
+  const lastAsst = msgs.find(m => m.role === 'assistant' || m.author === 'assistant' || m.sender === 'assistant');
+  ctx.lastAssistant = lastAsst?.content || lastAsst?.text || '';
+  ctx.sessionTail = msgs.slice(0, 4).reverse().map(m =>
+    `${m.role || m.author || m.sender || '?'}: ${String(m.content || m.text || '').slice(0, 100)}`);
+
+  const convoText = `${state.lastUserText} ${ctx.lastAssistant}`.toLowerCase();
+  const query = (thought.entityNames || [])
+      .filter(e => !GENERIC_ENTITIES.has(String(e).toLowerCase().trim()))
+      .join(' ')
+    || `${state.lastUserText} ${ctx.lastAssistant.slice(-160)}`.trim();
+
+  // Related live thoughts — every input producer writes thoughts, so this one
+  // list IS the all-inputs view. Non-silence: shared non-generic entities.
+  // Silence thoughts carry no entities (stripped at upsert), so match entities
+  // that literally appear in the conversation text instead.
+  const relRes = await heartbeat.memPost('thought.list', {
+    userId: USER_ID, statuses: ['thought', 'triggered'], limit: 50,
+  }).catch(() => null);
+  const live = relRes?.data?.thoughts || relRes?.thoughts || [];
+  ctx.related = live
+    .filter(t => t.id !== thought.id)
+    .map(t => ({
+      t,
+      shared: isSilence
+        ? (t.entityNames || []).filter(e => {
+            const n = String(e).toLowerCase().trim();
+            return n && !GENERIC_ENTITIES.has(n)
+              && (convoText.includes(n) || n.split(/\s+/).some(w => w.length >= 4 && convoText.includes(w)));
+          }).length
+        : _sharedEntityCount(thought.entityNames, t.entityNames),
+    }))
+    .filter(x => x.shared > 0)
+    .sort((a, b) => (b.t.score || 0) - (a.t.score || 0))
+    .slice(0, 5)
+    .map(x => x.t);
+
+  if (query) {
+    const [memR, epiR] = await Promise.allSettled([
+      // Semantic memory: unbounded horizon — minSimilarity is the recall gate,
+      // not the calendar. personal_profile rows never decay service-side.
+      heartbeat.memPost('memory.search', { query, limit: 5, minSimilarity: 0.45, maxAgeDays: 0 }),
+      // Recent screen activity: days-scale episodic recall.
+      heartbeat.memPost('episodic.search', { query, limit: 4, maxAgeDays: 3 }),
+    ]);
+    const mems = memR.status === 'fulfilled' ? (memR.value?.data?.results || memR.value?.results || []) : [];
+    ctx.memories = mems
+      .map(m => String(m.source_text || m.text || '').replace(/\s+/g, ' ').trim())
+      .filter(Boolean).slice(0, 5);
+    let caps = epiR.status === 'fulfilled' ? (epiR.value?.data?.results || epiR.value?.results || []) : [];
+    // Adaptive deepening: thin bundle → widen the episodic window, like a human
+    // digging further back when the topic matters but recent evidence is sparse.
+    if (caps.length + ctx.memories.length + ctx.related.length < 3) {
+      const epiR2 = await heartbeat.memPost('episodic.search', { query, limit: 4, maxAgeDays: 14 }).catch(() => null);
+      const wider = epiR2?.data?.results || epiR2?.results || [];
+      if (wider.length > caps.length) caps = wider;
+    }
+    ctx.captures = caps.map(m => {
+      const app = m.metadata?.appName || m.metadata?.app || '';
+      const text = String(m.extracted_text || m.source_text || m.text || '').replace(/\s+/g, ' ').trim();
+      return (app ? `${app}: ${text}` : text).slice(0, 160);
+    }).filter(s => s.length > 10).slice(0, 4);
+  }
+
+  // Past-conversation callback — a related prompt thought's sources hold the
+  // sessionId of the chat it came from; pull a couple of turns so the LLM can
+  // recall "you asked about this on Tuesday" like a human would.
+  const pastSessions = ctx.related
+    .filter(t => t.input === 'prompt')
+    .flatMap(t => (Array.isArray(t.sources) ? t.sources : []))
+    .filter(s => s && s !== state.lastSessionId)
+    .slice(0, 2);
+  for (const sid of pastSessions) {
+    const res = await convPost('message.list', { sessionId: sid, limit: 4, direction: 'DESC' }).catch(() => null);
+    const pMsgs = res?.data?.messages || res?.result?.messages || [];
+    const userMsg = pMsgs.find(m => m.role === 'user' || m.author === 'user' || m.sender === 'user');
+    if (userMsg) ctx.pastConvo.push(String(userMsg.content || userMsg.text || '').slice(0, 120));
+  }
+  return ctx;
 }
 
 /**
@@ -834,13 +977,22 @@ async function maybeTriggerUrgent(thought) {
 }
 
 /** Constrained LLM action assignment — shared by trigger() and shadow eval. */
-async function assignAction(thought) {
+async function assignAction(thought, opts = {}) {
   const overlayText = (await getOverlay()) || '';
   const { mood_label } = await getMoodContext();
   const active = userActive();
+  const topicCtx = await gatherTopicContext(thought);
+  const lastAssistant = (topicCtx.lastAssistant || '').slice(-500);
+  console.log(`[ThoughtEngine] Topic context: ${topicCtx.related.length} related, ${topicCtx.memories.length} memories, ${topicCtx.captures.length} captures, ${topicCtx.pastConvo.length} past-convo`);
   const trail = (thought.reinforcements || [])
     .map(tr => `${tr.input}@${new Date(tr.ts).toLocaleDateString('en-US', { weekday: 'short' })}`)
     .join(' · ');
+  const topicBlock = [
+    topicCtx.related.length ? `Related signals: ${topicCtx.related.map(t => `[${t.input}] ${String(t.summary).slice(0, 80)}`).join(' · ')}` : '',
+    topicCtx.memories.length ? `Stored memories: ${topicCtx.memories.map(m => `"${m.slice(0, 120)}"`).join(' | ')}` : '',
+    topicCtx.captures.length ? `Recent screen activity: ${topicCtx.captures.map(c => `"${c}"`).join(' | ')}` : '',
+    topicCtx.pastConvo.length ? `Earlier conversation: ${topicCtx.pastConvo.map(c => `"${c}"`).join(' | ')}` : '',
+  ].filter(Boolean).join('\n');
 
   const prompt = `A proactive desktop assistant's internal "thought" just crossed its trigger threshold. Choose ONE action from the closed vocabulary.
 
@@ -851,28 +1003,62 @@ Age: ${Math.round((now() - new Date(thought.createdAt).getTime()) / 3600000)}h; 
 User presence: ${active ? 'ACTIVE at machine' : 'INACTIVE (away or idle)'}
 Time now: ${new Date().toLocaleString()}
 Current mood: ${mood_label || 'content'}
+Conversation context:
+- User's last message: "${state.lastUserText.slice(0, 300) || 'none'}"
+- Assistant's latest reply (tail): "${lastAssistant || 'none'}"
+- Recent exchange: ${topicCtx.sessionTail.join(' || ') || 'none'}
+- Nudges already delivered this session: ${state.recentNudges.join(' | ') || 'none'}
+What we know about this topic (all inputs):
+${topicBlock || 'No related signals found.'}
 Persona context:
 ${overlayText.slice(0, 1200)}
 
 ACTION VOCABULARY (choose exactly one):
 - "notify": tell the user something useful/timely. payload: {"text": "what to say"}
 - "question": ask the user a decision question. payload: {"text": "what to ask"}
-- "prompt": autonomously do work (research, write a doc, compile a summary). payload: {"prompt": "the task instruction"}
+- "prompt": do real work on the user's behalf — draft or send an email/message to someone, research and compile a brief, write notes/links to a file, build a small useful artifact (doc, mini-app, organized folder), or organize something. payload: {"prompt": "the task instruction written as the work to perform"}
 - "skill": run a deterministic capability. payload: {"skill": "name", "args": {}}
 - "remember": quietly save an insight to long-term memory (optional short text to also show the user). payload: {"memory": "what to store", "text": "optional user-facing note"}
 - "watch": monitor a condition and notify when it resolves. payload: {"condition": "what to watch for", "checkType": "pixel_still|task_state|episodic_query|ocr_contains|time", "target": "app/window name", "marker": "OCR text to appear (ocr_contains)", "minutes": 30, "notifyPayload": "what to say when it resolves", "text": "optional spoken offer like 'I'll watch it'"}. Use pixel_still for generation/download finishing (screen stops changing); task_state for dispatched tasks; time for deadlines.
 - "skip": triggered but no useful action right now — let it expire quietly. payload: {"reason": "why"}
 
 Rules:
-- Prefer "skip" if acting would interrupt without clear value — a quiet miss beats a noisy interruption.${thought.input === 'silence' ? `
-- This is an unanswered-question follow-up — the user went quiet mid-conversation, so a gentle check-in is usually the right action; only "skip" if a nudge would be clearly wrong.` : ''}
+- Prefer "skip" if acting would interrupt without clear value — a quiet miss beats a noisy interruption.
+- You have everything the user has seen, done, and said about this topic across prompts, screen activity, tasks, and memory — including how recently and often it came up. Act like a thoughtful human assistant: surface NEW info they haven't seen, connect signals they haven't connected, act on their behalf, or ask a genuinely useful question. Never restate what the evidence already covers.
+- For anything that sends, modifies, or creates externally (emails, files, posts), choose "prompt" with needsApproval:true — the approval card IS your offer ("I can send that summary to Y — approve?"). Offering to do the work with permission beats asking an abstract question.
+- Never repeat, paraphrase, or re-offer something the assistant already said or provided — a follow-up must add a new angle, new info, or a next step. If the natural action merely echoes the assistant's latest reply, choose "skip".${thought.input === 'silence' ? `
+- This is an unanswered-question follow-up — the user went quiet mid-conversation, so a gentle check-in is usually the right action; only "skip" if a nudge would be clearly wrong. Reference the pending question in genuinely different words than the nudges already sent — don't reuse their phrasing.` : ''}
 - If the user is INACTIVE, still pick the action — delivery is handled separately.
-- Match the persona's tone (see context above). If phrasing includes faith-sensitive content, keep it gentle and caring.
+- Match the persona's tone (see context above). If phrasing includes faith-sensitive content, keep it gentle and caring.${opts.avoidEcho ? `
+- STRICT: your previous suggestion was rejected as a repeat of: "${String(opts.avoidEcho).slice(0, 160)}". Produce a clearly different angle and phrasing, or choose "skip".` : ''}
 Return JSON ONLY: {"type":"...","payload":{...},"reason":"one sentence why","urgency":"low|medium|high","needsApproval":false}`;
 
   const choice = await heartbeat.askLLMJson(prompt, '');
   const action = normalizeAction(choice);
   if (!action) return { type: 'skip', payload: { reason: 'invalid LLM output' }, reason: 'action parse failed', urgency: 'low' };
+
+  // Echo guard — notify/question text that mostly parrots the assistant's last
+  // reply or an earlier nudge gets one retry (silence follow-ups must still
+  // land) or converts to skip. Comparing to lastAssistant tail works because
+  // deliver() records each nudge as an assistant turn. A question that just
+  // restates the thought's own summary is the re-offer parrot — flagged for
+  // non-silence thoughts only (silence summaries embed the pending question
+  // verbatim, so similarity there is expected). Notify text is exempt from the
+  // summary check: stating the thought's content is often its whole job.
+  if (action.type === 'notify' || action.type === 'question') {
+    const text = String(action.payload?.text || '');
+    const simA = lastAssistant ? _wordContainment(text, lastAssistant) : 0;
+    const simN = Math.max(0, ...state.recentNudges.map(n => _wordContainment(text, n)));
+    const simS = action.type === 'question' && thought.input !== 'silence'
+      ? _wordContainment(text, thought.summary) : 0;
+    if (Math.max(simA, simN, simS) >= ECHO_SIM) {
+      console.log(`[ThoughtEngine] Echo check "${text.slice(0, 60)}" sim=${Math.max(simA, simN, simS).toFixed(2)} → ${thought.input === 'silence' && !opts.avoidEcho ? 'retry' : 'skip'}`);
+      if (thought.input === 'silence' && !opts.avoidEcho) {
+        return assignAction(thought, { avoidEcho: text });
+      }
+      return { type: 'skip', payload: { reason: 'echo of previous message' }, reason: 'echo of previous message', urgency: 'low' };
+    }
+  }
   return action;
 }
 
@@ -884,8 +1070,13 @@ async function trigger(thought, preassignedAction = null) {
   const action = preassignedAction || await assignAction(thought);
 
   // ── Gates ──────────────────────────────────────────────────────────────
-  // 1) Biblical gate (same check heartbeat uses for proactive outreach)
-  if (action.type !== 'skip') {
+  // 1) Biblical gate — vets side-effecting/novel-content actions (prompt,
+  //    skill, watch, remember). Conversational question/notify deliveries
+  //    skip it: a follow-up re-asking the assistant's own turn isn't a new
+  //    ethical surface, and the strict best-interest bar was vetoing benign
+  //    check-ins ("how far do you run?"). constraint.check still applies.
+  const GATED_ACTIONS = new Set(['prompt', 'skill', 'watch', 'remember']);
+  if (GATED_ACTIONS.has(action.type)) {
     const candidate = `${action.type}: ${action.payload?.text || action.payload?.prompt || action.payload?.memory || ''}`;
     const passes = await heartbeat.biblicalGate(candidate);
     if (!passes) {
@@ -935,7 +1126,7 @@ function normalizeAction(choice) {
   };
 }
 
-async function executeAction(thought, action) {
+async function executeAction(thought, action, opts = {}) {
   let outcomeText = '';
   switch (action.type) {
     case 'skip': {
@@ -950,8 +1141,9 @@ async function executeAction(thought, action) {
     case 'question': {
       const text = action.payload?.text || thought.summary;
       const delivery = { thoughtId: thought.id, kind: action.type, text, urgency: action.urgency };
-      if (action.type === 'question' && action.urgency !== 'high') {
-        // Questions escalate the silence chain — remember the nudge phrasing
+      if (action.urgency !== 'high') {
+        // Remember delivered outreach phrasing so later follow-ups and the
+        // echo guard can keep new messages genuinely distinct.
         state.recentNudges.push(text.slice(0, 120));
         if (state.recentNudges.length > 5) state.recentNudges.shift();
       }
@@ -986,7 +1178,11 @@ async function executeAction(thought, action) {
       const slug = (thought.summary || 'work').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 40) || 'work';
       const outDir = path.join(os.homedir(), '.thinkdrop', 'brain', `${slug}-${thought.id.slice(-6)}`);
       const taskPrompt = `${action.payload?.prompt || thought.summary}\n\nSave any files you produce to: ${outDir}`;
-      const r = await commsPost('/comms.proactive', { prompt: taskPrompt, thoughtId: thought.id });
+      // userApproved: when the Brain card collected the user's OK, downstream
+      // planning must not raise a second approval gate for the same item.
+      const r = await commsPost('/comms.proactive', {
+        prompt: taskPrompt, thoughtId: thought.id, userApproved: opts.userApproved === true,
+      });
       const taskId = r?.taskId || r?.data?.taskId;
       if (taskId) state.taskToThought.set(taskId, { thoughtId: thought.id, outDir });
       outcomeText = taskId ? `dispatched task ${taskId} → ${outDir}` : 'dispatched to comms-graph';
@@ -1025,7 +1221,7 @@ async function executeAction(thought, action) {
  */
 async function correlateTaskResult(taskId, status, result) {
   const link = state.taskToThought.get(taskId);
-  if (!link) return;
+  if (!link) return false;
   state.taskToThought.delete(taskId);
   let artifacts = [];
   // The dispatched agent often returns text without writing files — persist
@@ -1051,6 +1247,7 @@ async function correlateTaskResult(taskId, status, result) {
     updates: { outcomeText: outcome, action: { type: 'prompt', payload: { outDir: link.outDir, artifacts } } },
   });
   emitThoughtEvent('completed', { id: link.thoughtId, outcomeText: outcome });
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,7 +1473,7 @@ async function decide(thoughtId, decision, options = {}) {
     return { ok: true, snoozedUntil: until };
   }
   if (decision === 'approve') {
-    await executeAction(thought, thought.action || { type: 'skip', payload: {}, reason: '', urgency: 'low' });
+    await executeAction(thought, thought.action || { type: 'skip', payload: {}, reason: '', urgency: 'low' }, { userApproved: true });
     return { ok: true, executed: true };
   }
   await heartbeat.memPost('thought.update', {
