@@ -1433,6 +1433,9 @@ async function deliver(d) {
     try {
       await convPost('message.add', {
         sessionId: state.lastSessionId, sender: 'assistant', text: d.text,
+        // Marks this as thought-engine outreach so the Results feed reloads it
+        // as a proactive entry (brain styling) rather than a plain chat bubble.
+        metadata: { source: 'thought_engine', thoughtId: d.thoughtId, kind: d.kind },
       });
     } catch (e) {
       console.warn('[ThoughtEngine] message.add for nudge failed:', e.message);
