@@ -281,7 +281,7 @@ async function handleInput(body) {
   }
 }
 
-async function onPrompt({ text, sessionId }) {
+async function onPrompt({ text, sessionId, thoughtId }) {
   if (!text || !text.trim()) return { ok: false, reason: 'empty' };
   state.lastUserPromptAt = now();
   state.lastUserText = text;
@@ -311,7 +311,9 @@ async function onPrompt({ text, sessionId }) {
 
   const cand = await extractCandidate('prompt', text);
   if (!cand) return { ok: false, reason: 'extract_null' };
-  const result = await upsertCandidate('prompt', cand, { srcIds: [sessionId].filter(Boolean) });
+  // thoughtId links reply-derived candidates to the card that prompted them —
+  // the reply text arrives already stripped of the [Thought:] blob upstream.
+  const result = await upsertCandidate('prompt', cand, { srcIds: [sessionId, thoughtId].filter(Boolean) });
   return { ok: true, ...result };
 }
 
