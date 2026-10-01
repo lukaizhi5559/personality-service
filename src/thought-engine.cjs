@@ -102,6 +102,13 @@ const WATCH_INTENT_RE = /\b(watch|monitor|keep an eye on)\b|\b(let me know|tell 
 
 // Quiet hours "23-7": voice deliveries held in-window; cards still emit.
 const QUIET_HOURS = process.env.THOUGHT_QUIET_HOURS || '';
+// Voice floor: which urgencies get spoken. 'low' speaks everything, 'medium'
+// (default) voices normal+high, 'high' only voices urgent thoughts.
+const VOICE_URGENCY = (process.env.THOUGHT_VOICE_URGENCY || 'medium').toLowerCase();
+const VOICE_URGENCY_RANK = { low: 0, medium: 1, high: 2 };
+function urgencyAudible(u) {
+  return (VOICE_URGENCY_RANK[u] ?? 1) >= (VOICE_URGENCY_RANK[VOICE_URGENCY] ?? 1);
+}
 function inQuietHours() {
   const m = QUIET_HOURS.match(/^(\d{1,2})\s*-\s*(\d{1,2})$/);
   if (!m) return false;
@@ -1443,8 +1450,13 @@ async function deliver(d) {
       console.warn('[ThoughtEngine] message.add for nudge failed:', e.message);
     }
   }
-  if (d.urgency !== 'low' && !inQuietHours()) {
+  const audible = urgencyAudible(d.urgency);
+  const quiet = inQuietHours();
+  if (audible && !quiet) {
+    console.log(`[ThoughtEngine] voice: urgency=${d.urgency} → speaking "${d.text.slice(0, 60)}"`);
     await heartbeat.voiceSpeak(d.text);
+  } else {
+    console.log(`[ThoughtEngine] voice: card-only — urgency=${d.urgency} floor=${VOICE_URGENCY} quietHours=${quiet}`);
   }
 }
 
