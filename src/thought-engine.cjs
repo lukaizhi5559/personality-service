@@ -34,6 +34,24 @@ const { getOverlay, getMoodContext } = require('./personality-doc.cjs');
 // Config (all env-tunable)
 // ---------------------------------------------------------------------------
 const ENABLED = process.env.THOUGHT_ENGINE_ENABLED !== 'false';
+
+// Runtime toggle — the Settings tab writes thoughtsEnabled to the shared
+// ~/.thinkdrop/settings.json; we poll it on a short TTL so the engine pauses
+// without a service restart. Missing/unreadable file defaults to enabled.
+const USER_SETTINGS_FILE = path.join(os.homedir(), '.thinkdrop', 'settings.json');
+let _settingsCache = { at: 0, on: true };
+function _isEnabled() {
+  if (!ENABLED) return false;
+  const nowMs = Date.now();
+  if (nowMs - _settingsCache.at < 5000) return _settingsCache.on;
+  let on = true;
+  try { on = JSON.parse(fs.readFileSync(USER_SETTINGS_FILE, 'utf8')).thoughtsEnabled !== false; }
+  catch (_) { on = _settingsCache.on; }
+  if (on !== _settingsCache.on) console.log(`[ThoughtEngine] thoughtsEnabled=${on} — engine ${on ? 'resumed' : 'paused'} via Settings`);
+  _settingsCache = { at: nowMs, on };
+  return on;
+}
+
 const SHADOW = process.env.THOUGHT_SHADOW === 'true'; // log would-be triggers, never act
 // Whitelist of action types that execute for real even under shadow mode —
 // e.g. THOUGHT_LIVE_ACTIONS=notify,question delivers alerts while prompt/skill
@@ -264,7 +282,7 @@ function emitThoughtEvent(kind, thought, extra) {
  *   { type: 'queue',  ... }                — Phase 2
  */
 async function handleInput(body) {
-  if (!ENABLED) return { ok: false, reason: 'disabled' };
+  if (!_isEnabled()) return { ok: false, reason: 'disabled' };
   const type = body?.type;
   try {
     // Rate-cap high-frequency producers before spending an extraction call
@@ -524,6 +542,7 @@ async function upsertCandidate(input, cand, { srcIds = [], silenceEpisode = 0, f
  *   extended absence  user away/asleep → triggered actions execute, delivery held
  */
 async function silenceTick() {
+  if (!_isEnabled()) return;
   // Reentrancy guard — interval + any other caller must not interleave on the
   // awaits inside (attribNextAt gate, extraction, upsert).
   if (state.silenceBusy) return;
@@ -1431,6 +1450,7 @@ checkType guide: 'time' for "in N minutes/at TIME"; 'pixel_still' for "when gene
 
 /** Deliver a notify/question — voice for higher urgency, card always. */
 async function deliver(d) {
+  if (!_isEnabled()) return;
   // Card + optional voice. Card goes to the Brain tab via thought:update;
   // voice only for medium/high urgency (JITIR: default delivery is ignorable).
   emitThoughtEvent(d.kind === 'question' ? 'question' : 'notify',
@@ -1505,7 +1525,7 @@ async function decide(thoughtId, decision, options = {}) {
 // ---------------------------------------------------------------------------
 
 async function tick() {
-  if (!ENABLED) return;
+  if (!_isEnabled()) return;
   // silenceTick is owned by the dedicated SILENCE_SCAN_MS interval — calling it
   // here too races the 5s scan on the attribNextAt gate (duplicate evals).
   try {
