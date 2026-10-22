@@ -97,6 +97,7 @@ const TRACE_WEIGHT = {
   memory: parseFloat(process.env.THOUGHT_W_MEMORY || '0.4'),
   queue: parseFloat(process.env.THOUGHT_W_QUEUE || '0.4'),
   silence: parseFloat(process.env.THOUGHT_W_SILENCE || '0.4'),
+  plan: parseFloat(process.env.THOUGHT_W_PLAN || '0.5'),
   judgment: 0.15,
 };
 // High time-sensitivity candidates jump the queue — a download watched too late
@@ -299,6 +300,7 @@ async function handleInput(body) {
     if (type === 'monitor') return onMonitor(body);
     if (type === 'queue') return await onQueue(body);
     if (type === 'memory') return await onMemory(body);
+    if (type === 'plan') return await onPlan(body);
     return { ok: false, reason: 'unknown_type' };
   } catch (e) {
     console.warn(`[ThoughtEngine] handleInput(${type}) failed:`, e.message);
@@ -432,6 +434,68 @@ function onMonitor({ eventType, info }) {
   // machine — flush held notifications (deliver-on-wake).
   flushPending().catch(() => {});
   return { ok: true, eventType };
+}
+
+// ── Plan lifecycle inputs (comms-graph 'plan' notifications) ────────────────
+// A plan-bound task reaching a blocked/terminal state is evidence the Brain
+// should act on. Safe blocks auto-resume through /plan.run (main's plan-check
+// re-gates auth — resume can never bypass consent); consent-shaped blocks
+// (approval, auth, input) surface a continue_plan card instead.
+const PLAN_AUTO_RESUME = new Set(['failed', 'cancelled', 'plan_update', 'revising']);
+const PLAN_ASK = new Set(['awaiting-approval', 'auth-required', 'waiting-for-input']);
+const PLAN_RESUME_DEBOUNCE_MS = 90 * 1000;
+
+async function onPlan({ planId, taskNum, status, prompt, taskCount }) {
+  if (!planId) return { ok: false, reason: 'no_plan_id' };
+  state.planResumeAt = state.planResumeAt || new Map();
+  const short = `plan ${planId}${taskNum ? ` · task ${taskNum}` : ''} — ${status}`;
+
+  if (status === 'done' || status === 'completed') {
+    // Settled — any open continue-plan thought loses its reason to exist.
+    state.planResumeAt.delete(planId);
+    return { ok: true, settled: true };
+  }
+
+  if (PLAN_AUTO_RESUME.has(status)) {
+    const last = state.planResumeAt.get(planId) || 0;
+    if (now() - last < PLAN_RESUME_DEBOUNCE_MS) return { ok: true, reason: 'resume_debounced' };
+    state.planResumeAt.set(planId, now());
+    await mainPost('/plan.run', { planId }).catch(() => {});
+    await upsertCandidate('plan', {
+      summary: `${short} — auto-resumed via plan-check`,
+      entityNames: [String(prompt || '').slice(0, 80)].filter(Boolean),
+      actionNames: ['resume'],
+      contextScore: 0.9,
+      timeSensitive: true,
+    }, { srcIds: [planId] });
+    return { ok: true, resumed: true };
+  }
+
+  if (PLAN_ASK.has(status)) {
+    // Consent gate — never auto-resume; a Brain card asks the user.
+    return {
+      ok: true,
+      ...(await upsertCandidate('plan', {
+        summary: `${short} — waiting on you (${status})${prompt ? `: ${String(prompt).slice(0, 100)}` : ''}`,
+        entityNames: [planId],
+        actionNames: ['review', 'approve'],
+        contextScore: 1,
+        timeSensitive: true,
+      }, { srcIds: [planId], urgent: status === 'awaiting-approval' })),
+    };
+  }
+
+  // Informational lifecycle events (draft, running, task done) — light trace.
+  return {
+    ok: true,
+    ...(await upsertCandidate('plan', {
+      summary: `${short}${taskCount ? ` (${taskCount} tasks)` : ''}${prompt ? `: ${String(prompt).slice(0, 80)}` : ''}`,
+      entityNames: [planId],
+      actionNames: ['monitor'],
+      contextScore: 0.5,
+      timeSensitive: false,
+    }, { srcIds: [planId] })),
+  };
 }
 
 // ---------------------------------------------------------------------------
