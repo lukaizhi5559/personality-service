@@ -28,6 +28,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const heartbeat = require('./heartbeat.cjs');
+const decision = require('./decision.cjs');
 const { getOverlay, getMoodContext } = require('./personality-doc.cjs');
 
 // ---------------------------------------------------------------------------
@@ -534,6 +535,44 @@ Rules:
 - timeSensitive: true ONLY if the state is transient and resolves within minutes (download/build/generation in progress, payment processing, error dialog, live call). Interests and research are NOT time-sensitive.
 - summary must be specific, never generic ("user browsing a page" → score 0).${silenceRules}`;
 
+  // ── Local decision fast path — bounded fields + noise gate ──────────────
+  // contextScore/timeSensitive (+silence verdict) are finite-vocabulary;
+  // summary/entities still need the remote call — but noise (the dominant
+  // OCR/pause case) can be rejected without paying for it.
+  let _local = null;
+  try {
+    const qs = [
+      { id: 'ctx', type: 'score', min: 0, max: 1, question: 'How meaningful is this observed activity — worth remembering as a sustained interest? 0 = trivial noise (acknowledgements like "ok"/"one moment", idle screens, login screens, generic browsing); 1 = clearly meaningful activity.' },
+      { id: 'ts', type: 'noul', question: 'Is this state transient and resolves within minutes (download/build/generation in progress, payment processing, error dialog, live call)? Interests and research are NOT time-sensitive.' },
+    ];
+    if (sourceKind === 'silence') qs.push(
+      { id: 'nudge', type: 'noul', question: 'Is reaching out to the user right now appropriate at all?' },
+      { id: 'urgency', type: 'choice', question: 'How urgent is a follow-up? deadline/time-pressure → high; sensitive or casual → low.', options: ['low', 'normal', 'high'] },
+      { id: 'standDown', type: 'noul', question: 'After several ignored nudges, should the assistant gracefully stop nudging (standby)?' },
+      { id: 'wait', type: 'score', min: 15, max: 300, question: 'Seconds before the next silence check-in eval (15–300).' },
+      { id: 'register', type: 'choice', question: 'Tone register for a follow-up to this topic.', options: ['gentle', 'playful', 'caring', 'neutral', 'urgent'] },
+    );
+    const r = await decision.askDecision(qs, { state: truncated });
+    if (r?.answers?.ctx) {
+      const score = r.answers.ctx.number ?? 0.5;
+      if (score < 0.15) {
+        logger.info?.(`[ThoughtEngine] local noise gate: contextScore=${score.toFixed(2)} < 0.15 — skipping remote extract (${sourceKind})`);
+        return null;
+      }
+      _local = {
+        score,
+        timeSensitive: r.answers.ts?.bool === true,
+        silence: sourceKind === 'silence' && r.answers.nudge ? {
+          nudge: r.answers.nudge.bool !== false,
+          urgency: ['low', 'normal', 'high'][r.answers.urgency?.index ?? 1],
+          waitSec: Math.max(15, Math.min(300, Math.round(r.answers.wait?.number ?? ATTRIB_NUDGE_MS / 1000))),
+          standDown: r.answers.standDown?.bool === true,
+          register: ['gentle', 'playful', 'caring', 'neutral', 'urgent'][r.answers.register?.index ?? 3],
+        } : null,
+      };
+    }
+  } catch (_) { /* fail-open → remote below */ }
+
   const out = await heartbeat.askLLMJson(prompt, truncated);
   if (!out || typeof out !== 'object') return null;
   if (!out.summary || typeof out.summary !== 'string') return null;
@@ -542,15 +581,15 @@ Rules:
     summary: out.summary.trim(),
     entityNames: Array.isArray(out.entities) ? out.entities.slice(0, 8).map(String) : [],
     actionNames: Array.isArray(out.actions) ? out.actions.slice(0, 6).map(String) : [],
-    contextScore: Math.max(0, Math.min(1, Number(out.contextScore ?? 0.5))),
-    timeSensitive: out.timeSensitive === true,
-    silence: s ? {
+    contextScore: Math.max(0, Math.min(1, Number(_local ? _local.score : (out.contextScore ?? 0.5)))),
+    timeSensitive: _local ? _local.timeSensitive : (out.timeSensitive === true),
+    silence: _local?.silence || (s ? {
       nudge: s.nudge !== false,
       urgency: ['low', 'normal', 'high'].includes(s.urgency) ? s.urgency : 'normal',
       waitSec: Math.max(15, Math.min(300, Number(s.waitSec) || ATTRIB_NUDGE_MS / 1000)),
       standDown: s.standDown === true,
       register: typeof s.register === 'string' ? s.register.slice(0, 120) : '',
-    } : null,
+    } : null),
   };
 }
 
@@ -1124,6 +1163,20 @@ Rules:
 - Match the persona's tone (see context above). If phrasing includes faith-sensitive content, keep it gentle and caring.${opts.avoidEcho ? `
 - STRICT: your previous suggestion was rejected as a repeat of: "${String(opts.avoidEcho).slice(0, 160)}". Produce a clearly different angle and phrasing, or choose "skip".` : ''}
 Return JSON ONLY: {"type":"...","payload":{...},"reason":"one sentence why","urgency":"low|medium|high","needsApproval":false}`;
+
+  // ── Local pre-gate — confident "nothing useful here" skips the remote call
+  // Only a strongly-negative local verdict short-circuits; yes/fail → remote.
+  try {
+    const r = await decision.askDecision([{
+      id: 'act', type: 'noul',
+      question: 'Would any proactive action here deliver clear NEW value to the user right now — not merely echoing what they already saw/did/said, and worth interrupting for? Answer no if a quiet miss beats a noisy interruption.',
+    }], { state: `Thought: ${String(thought.summary || '').slice(0, 300)}\nAssistant latest: ${String(lastAssistant || '').slice(0, 300)}\nRecent nudges: ${state.recentNudges.join(' | ') || 'none'}` });
+    const p = r?.answers?.act?.probability;
+    if (typeof p === 'number' && p <= 0.2) {
+      logger.info?.(`[ThoughtEngine] assignAction local pre-gate: p=${p.toFixed(2)} → skip (remote avoided)`);
+      return { type: 'skip', payload: { reason: 'local-decision: no clear new value' }, reason: 'local-decision', urgency: 'low' };
+    }
+  } catch (_) { /* fail-open → remote */ }
 
   const choice = await heartbeat.askLLMJson(prompt, '');
   const action = normalizeAction(choice);

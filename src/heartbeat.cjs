@@ -22,6 +22,7 @@ const logger          = require('./logger.cjs');
 const MEMORY_SERVICE_PORT  = parseInt(process.env.MEMORY_SERVICE_PORT  || '3001', 10);
 const COMMAND_SERVICE_PORT = parseInt(process.env.COMMAND_SERVICE_PORT || '3007', 10);
 const VOICE_SERVICE_PORT   = parseInt(process.env.VOICE_SERVICE_PORT   || '3006', 10);
+const decision = require('./decision.cjs');
 const LLM_WS_URL           = process.env.STATEGRAPH_WS_URL || 'ws://localhost:4000/ws/stream';
 const MEM_API_KEY = process.env.MCP_USER_MEMORY_API_KEY || process.env.USER_MEMORY_API_KEY || process.env.MCP_API_KEY || '';
 
@@ -189,6 +190,20 @@ async function askLLMJson(systemPrompt, userPrompt, timeoutMs) {
 // ── Biblical best-interest gate ────────────────────────────────────────────────
 
 async function biblicalGate(actionDescription) {
+  // ── Local decision fast path — bounded yes/no ethical gate ──────────────
+  // Fail-open to the remote askLLM on any local error or null.
+  try {
+    const r = await decision.askDecision([{
+      id: 'gate', type: 'noul',
+      question: 'Is this action in the user\'s best interest from a biblical perspective aligned with Jesus Christ\'s values? Answer yes unless the action is harmful, deceptive, or morally objectionable.',
+    }], { state: 'Action: ' + String(actionDescription).slice(0, 800) });
+    if (r?.answers?.gate) {
+      const passed = r.answers.gate.bool === true;
+      logger.info('[Heartbeat] Biblical gate (local)', { action: actionDescription.slice(0, 60), passed, p: r.answers.gate.probability });
+      return passed;
+    }
+  } catch (_) { /* fail-open → remote */ }
+
   const gatePrompt = 'You are a strict ethical filter with a biblical worldview centered on Jesus Christ. ' +
     'Answer ONLY with the single word "yes" or "no". No explanation. ' +
     'Is the following action in the user\'s best interest from a biblical perspective aligned with Jesus Christ\'s values? ' +
@@ -304,7 +319,33 @@ async function runTier2() {
       'Respond with JSON only: {"adjustments":[{"id":"th_...","w":0.0,"reason":"short"}]}';
 
     const userPrompt = 'Open thoughts:\n' + digest;
-    const decision = await askLLMJson(systemPrompt, userPrompt, 25000);
+
+    // ── Local decision fast path — per-thought score adjustments ───────────
+    // Each open thought gets a bounded score question (-0.5..+0.5). When the
+    // local model answers, judgments apply directly — the remote call is
+    // skipped entirely (its only extra output is a log-only reason string).
+    let decision = null;
+    try {
+      const qs = thoughts.slice(0, 20).map((t, i) => ({
+        id: `t${i}`, type: 'score', min: -0.5, max: 0.5,
+        question: `Score adjustment for this open thought: "${String(t.summary || '').slice(0, 120)}" (score=${(t.score ?? t.currentScore ?? 0)}, judgments=${_judgeCount.get(t.id) || 0}). +0.1..+0.3 for sustained cross-modal evidence or clear user value; -0.1..-0.3 for noise, one-off curiosities, or resolved items; ~0 when no pattern is visible.`,
+      }));
+      if (qs.length) {
+        const r = await decision.askDecision(qs, { state: userPrompt });
+        if (r?.answers) {
+          const adjustments = [];
+          thoughts.slice(0, 20).forEach((t, i) => {
+            const a = r.answers[`t${i}`];
+            const w = a?.number ?? 0;
+            if (Math.abs(w) >= 0.05) adjustments.push({ id: t.id, w, reason: 'local-decision' });
+          });
+          decision = { adjustments };
+          logger.info(`[Heartbeat:T2] Local judgment pass — ${adjustments.length} adjustment(s)`);
+        }
+      }
+    } catch (_) { /* fail-open → remote */ }
+
+    if (!decision) decision = await askLLMJson(systemPrompt, userPrompt, 25000);
     if (!decision) return;
 
     const adjustments = Array.isArray(decision.adjustments) ? decision.adjustments : [];
