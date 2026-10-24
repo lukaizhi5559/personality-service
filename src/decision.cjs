@@ -43,7 +43,7 @@ async function askDecision(questions, opts = {}) {
       // Batch-scaled — silence/action batches carry several questions;
       // flat 3s ceiling timed them out on the small-tier model.
       signal: AbortSignal.timeout(opts.timeoutMs
-        || (process.env.DECISION_TIMEOUT_MS ? DEFAULT_TIMEOUT_MS : Math.min(1200 + 250 * (Array.isArray(questions) ? questions.length : 1), 12000))),
+        || (process.env.DECISION_TIMEOUT_MS ? DEFAULT_TIMEOUT_MS : Math.min(6000 + 400 * (Array.isArray(questions) ? questions.length : 1), 15000))),
     });
     const body = await res.json().catch(() => null);
     if (!body || body.status !== 'ok' || !body.data?.answers) return null;
